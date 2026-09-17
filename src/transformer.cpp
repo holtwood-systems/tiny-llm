@@ -496,11 +496,24 @@ Result<void> TransformerLayer::attentionPaged(const half *x, half *output,
     half *k_pool_layer = kv.k_pool + layer_idx_ * layer_stride;
     half *v_pool_layer = kv.v_pool + layer_idx_ * layer_stride;
 
-    // 把本步 K/V scatter 进 pool（允许一次额外显存往返，先正确后优化）
-    kernels::paged_scatter_blocks(ws_->k_buf, k_pool_layer, kv.block_table, num_tokens, kv.position,
-                                  kv.block_size, kv_dim, kv.max_num_blocks, stream);
-    kernels::paged_scatter_blocks(ws_->v_buf, v_pool_layer, kv.block_table, num_tokens, kv.position,
-                                  kv.block_size, kv_dim, kv.max_num_blocks, stream);
+    // 把本步 K/V scatter 进 pool（允许一次额外显存往返，先正确后优化）。
+    // position_dev 非空（decode graph 可重放路径）时位置从 device int 读取；
+    // host 标量路径保留给 prefill 与非 graph 调用方。
+    if (kv.position_dev != nullptr) {
+        kernels::paged_scatter_blocks_dev(ws_->k_buf, k_pool_layer, kv.block_table, num_tokens,
+                                          kv.position_dev, kv.block_size, kv_dim, kv.max_num_blocks,
+                                          stream);
+        kernels::paged_scatter_blocks_dev(ws_->v_buf, v_pool_layer, kv.block_table, num_tokens,
+                                          kv.position_dev, kv.block_size, kv_dim, kv.max_num_blocks,
+                                          stream);
+    } else {
+        kernels::paged_scatter_blocks(ws_->k_buf, k_pool_layer, kv.block_table, num_tokens,
+                                      kv.position, kv.block_size, kv_dim, kv.max_num_blocks,
+                                      stream);
+        kernels::paged_scatter_blocks(ws_->v_buf, v_pool_layer, kv.block_table, num_tokens,
+                                      kv.position, kv.block_size, kv_dim, kv.max_num_blocks,
+                                      stream);
+    }
 
     // 可见长度：prefill = num_tokens；decode（num_tokens==1 && decode_len）=
     // kv.position + 1（与 *kv.decode_len 一致）。
@@ -544,10 +557,21 @@ Result<void> TransformerLayer::attentionPaged(const half *x, half *output,
         }
     } else {
         // legacy：把可见区间 gather 到 scratch（连续布局），供连续 attention 使用。
-        kernels::paged_gather_blocks(kv.k_scratch, k_pool_layer, kv.block_table, visible,
-                                     kv.block_size, kv_dim, kv.max_num_blocks, stream);
-        kernels::paged_gather_blocks(kv.v_scratch, v_pool_layer, kv.block_table, visible,
-                                     kv.block_size, kv_dim, kv.max_num_blocks, stream);
+        // decode graph 路径（position_dev 非空）可见长度从 device int 读，
+        // grid 按 max_visible_tokens 满配发射；prefill / 非 graph 走 host 路径。
+        if (kv.position_dev != nullptr && kv.decode_len != nullptr) {
+            kernels::paged_gather_blocks_dev(kv.k_scratch, k_pool_layer, kv.block_table,
+                                             kv.decode_len, kv.block_size, kv_dim,
+                                             kv.max_num_blocks, kv.max_visible_tokens, stream);
+            kernels::paged_gather_blocks_dev(kv.v_scratch, v_pool_layer, kv.block_table,
+                                             kv.decode_len, kv.block_size, kv_dim,
+                                             kv.max_num_blocks, kv.max_visible_tokens, stream);
+        } else {
+            kernels::paged_gather_blocks(kv.k_scratch, k_pool_layer, kv.block_table, visible,
+                                         kv.block_size, kv_dim, kv.max_num_blocks, stream);
+            kernels::paged_gather_blocks(kv.v_scratch, v_pool_layer, kv.block_table, visible,
+                                         kv.block_size, kv_dim, kv.max_num_blocks, stream);
+        }
         if (is_decode) {
             // decode：单 query 对已 gather 的可见 K/V；可见长度由 device int 提供
             if (use_split) {

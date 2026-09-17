@@ -36,6 +36,9 @@
 #include <unistd.h>
 #include <vector>
 
+// ABI v3: 逐序列状态出参（本文件测试统一用共享缓冲）
+static int seq_status[256];
+
 namespace {
 
 bool hasCudaDevice() {
@@ -299,12 +302,12 @@ HandlePtr loadPaged(const char *path) {
 }
 
 // 单次 decode 步（策略 1，可选 logprobs）。
-// positions 不再被后端忽略：decode 必须传绝对位置（= context_len - 1，
-// 与后端 st.position 一致），否则 tinyllm_step 显式失败。
+// ABI v3：positions 为惰性参数（后端 SeqState 内部跟踪），传值仅作记录。
 int decodeStep(TinyLlmHandle *h, int tok, int nb, int pos, int *next, float *lp, int lp_k) {
     int           seq_ids[] = {0}, len1[] = {1};
     unsigned char dec[] = {0};
-    return tinyllm_step(h, seq_ids, &tok, &pos, len1, kBlocks.data(), &nb, dec, 1, next, lp, lp_k);
+    return tinyllm_step(h, seq_ids, &tok, &pos, len1, kBlocks.data(), &nb, dec, 1, next, lp, lp_k,
+                        seq_status);
 }
 
 struct SeqOut {
@@ -341,7 +344,7 @@ SeqOut runPagedSeq(TinyLlmHandle *h, int lp_k) {
     EXPECT_EQ(tinyllm_allocate_sequence(h, 0, kPromptLen + kDecodeSteps + 8), 0);
     int nb = 3;
     int rc = tinyllm_step(h, seq_ids, prompt.data(), pos0.data(), seq_lens, kBlocks.data(), &nb,
-                          pre, 1, &next, lp.data(), lp_k);
+                          pre, 1, &next, lp.data(), lp_k, seq_status);
     out.steps_rc.push_back(rc);
     if (rc != 0 || next < 0) {
         tinyllm_free_sequence(h, 0);
@@ -478,7 +481,7 @@ TEST_F(FfiPagedDispatchTest, StrategyTwoIgnoresAttentionSwitch) {
         int              next = -1;
         EXPECT_EQ(tinyllm_allocate_sequence(h.get(), 0, kPromptLen + kDecodeSteps + 8), 0);
         EXPECT_EQ(tinyllm_step(h.get(), seq_ids, prompt.data(), pos0.data(), seq_lens, nullptr,
-                               nullptr, pre, 1, &next, nullptr, 0),
+                               nullptr, pre, 1, &next, nullptr, 0, seq_status),
                   0);
         tokens.push_back(next);
         int pos = kPromptLen;
@@ -486,7 +489,7 @@ TEST_F(FfiPagedDispatchTest, StrategyTwoIgnoresAttentionSwitch) {
             int           in = kFeedToken, len1[] = {1};
             unsigned char dec[] = {0};
             EXPECT_EQ(tinyllm_step(h.get(), seq_ids, &in, &pos, len1, nullptr, nullptr, dec, 1,
-                                   &next, nullptr, 0),
+                                   &next, nullptr, 0, seq_status),
                       0);
             tokens.push_back(next);
             ++pos;
@@ -501,8 +504,8 @@ TEST_F(FfiPagedDispatchTest, StrategyTwoIgnoresAttentionSwitch) {
     EXPECT_EQ(run(), base);
 }
 
-// 块表不足时 tinyllm_step 干净返回 TLLM_ERR，且序列不被毒化：
-// 释放重分配后继续跑，仍与 legacy 基线一致。
+// 块表不足时（ABI v3）调用级仍返回 TLLM_OK，逐序列状态 seq_status[0]
+// 标记失败，且序列不被毒化：释放重分配后继续跑，仍与 legacy 基线一致。
 TEST_F(FfiPagedDispatchTest, ShortBlockTableFailsThenSequenceSurvives) {
     EnvGuard paged("TLLM_PAGED_ATTENTION");
     paged.set("direct");
@@ -516,10 +519,11 @@ TEST_F(FfiPagedDispatchTest, ShortBlockTableFailsThenSequenceSurvives) {
     int           too_few = 1; // 48 token 需 3 块，只给 1 块
 
     ASSERT_EQ(tinyllm_allocate_sequence(h.get(), 0, 64), 0);
-    EXPECT_NE(tinyllm_step(h.get(), seq_ids, prompt.data(), pos0.data(), seq_lens, kBlocks.data(),
-                           &too_few, pre, 1, &next, nullptr, 0),
+    EXPECT_EQ(tinyllm_step(h.get(), seq_ids, prompt.data(), pos0.data(), seq_lens, kBlocks.data(),
+                           &too_few, pre, 1, &next, nullptr, 0, seq_status),
               0)
-        << "undersized block table must fail";
+        << "call-level rc stays OK under ABI v3";
+    EXPECT_EQ(seq_status[0], TLLM_SEQ_ERR) << "undersized block table must fail this sequence";
     EXPECT_EQ(tinyllm_free_sequence(h.get(), 0), 0);
 
     const auto direct_tokens = runPagedSeq(h.get(), 0);
@@ -545,20 +549,92 @@ TEST_F(FfiPagedDispatchTest, InvalidSplitKvEnvFailsCleanly) {
     // env 在每次 attentionPaged 入口解析（不缓存）：非法值对 prefill 同样
     // 显式失败——先用合法环境完成 prefill，再注入非法值验证 decode 干净失败。
     ASSERT_EQ(tinyllm_step(h.get(), seq_ids, prompt.data(), pos0.data(), seq_lens, kBlocks.data(),
-                           &nb, pre, 1, &next, nullptr, 0),
+                           &nb, pre, 1, &next, nullptr, 0, seq_status),
               0);
 
     splitkv.set("garbage");
     nb = 4;
     int bad_next = -1;
-    EXPECT_NE(decodeStep(h.get(), kFeedToken, nb, kPromptLen, &bad_next, nullptr, 0), 0)
-        << "invalid TLLM_ATTN_SPLITKV must fail at decode dispatch";
+    EXPECT_EQ(decodeStep(h.get(), kFeedToken, nb, kPromptLen, &bad_next, nullptr, 0), 0)
+        << "call-level rc stays OK under ABI v3";
+    EXPECT_EQ(seq_status[0], TLLM_SEQ_ERR)
+        << "invalid TLLM_ATTN_SPLITKV must fail this sequence at decode dispatch";
 
     splitkv.unset();
     nb = 4;
     int good_next = -1;
     EXPECT_EQ(decodeStep(h.get(), kFeedToken, nb, kPromptLen, &good_next, nullptr, 0), 0)
         << "handle must stay usable after env restored";
+    EXPECT_EQ(seq_status[0], TLLM_SEQ_OK);
+    EXPECT_EQ(tinyllm_free_sequence(h.get(), 0), 0);
+}
+// ── ABI v3：逐序列状态 ─────────────────────────────────────────
+// 混合 batch：seq 0 合法、seq 1 块表不足。调用级返回 TLLM_OK，
+// seq 0 正常产出 next_token，seq 1 仅 seq_status 标记失败——不再株连。
+// 且失败序列 position 不推进：随后用合法块表重试 prefill 必须成功。
+TEST_F(FfiPagedDispatchTest, PartialBatchFailureDoesNotCascade) {
+    EnvGuard paged("TLLM_PAGED_ATTENTION");
+    paged.set("direct");
+    auto h = loadPaged(model_path_.c_str());
+    ASSERT_NE(h, nullptr);
+
+    const auto    prompt = promptTokens();
+    const auto    pos0 = promptPositions();
+    int           seq_ids[] = {0, 1};
+    int           seq_lens[] = {kPromptLen, kPromptLen};
+    unsigned char pre[] = {1, 1};
+    int           next[2] = {-1, -1};
+    // seq0 用满 5 块切片，seq1 只声明 1 块（48 token 需 3 块 → 失败）
+    int nb[2] = {5, 1};
+
+    ASSERT_EQ(tinyllm_allocate_sequence(h.get(), 0, 64), 0);
+    ASSERT_EQ(tinyllm_allocate_sequence(h.get(), 1, 64), 0);
+
+    EXPECT_EQ(tinyllm_step(h.get(), seq_ids, prompt.data(), pos0.data(), seq_lens, kBlocks.data(),
+                           nb, pre, 2, next, nullptr, 0, seq_status),
+              0);
+    EXPECT_EQ(seq_status[0], TLLM_SEQ_OK);
+    EXPECT_EQ(seq_status[1], TLLM_SEQ_ERR);
+    EXPECT_GE(next[0], 0) << "seq0 must produce a token despite seq1 failure";
+
+    // seq1 的 position 必须仍为 0（失败原子性）：合法块表重试 prefill 成功。
+    {
+        int           sid1[] = {1}, len1[] = {kPromptLen}, next1 = -1;
+        unsigned char pre1[] = {1};
+        int           nb1 = 3;
+        EXPECT_EQ(tinyllm_step(h.get(), sid1, prompt.data(), pos0.data(), len1, kBlocks.data(),
+                               &nb1, pre1, 1, &next1, nullptr, 0, seq_status),
+                  0);
+        EXPECT_EQ(seq_status[0], TLLM_SEQ_OK);
+        EXPECT_GE(next1, 0);
+    }
+
+    EXPECT_EQ(tinyllm_free_sequence(h.get(), 0), 0);
+    EXPECT_EQ(tinyllm_free_sequence(h.get(), 1), 0);
+}
+
+// 未分配 seq_id 混入 batch：同样只败自己、不株连。
+TEST_F(FfiPagedDispatchTest, UnallocatedSeqIdFailsOnlyItself) {
+    EnvGuard paged("TLLM_PAGED_ATTENTION");
+    paged.set("legacy");
+    auto h = loadPaged(model_path_.c_str());
+    ASSERT_NE(h, nullptr);
+
+    const auto    prompt = promptTokens();
+    const auto    pos0 = promptPositions();
+    int           seq_ids[] = {0, 9}; // 9 从未 allocate
+    int           seq_lens[] = {kPromptLen, kPromptLen};
+    unsigned char pre[] = {1, 1};
+    int           next[2] = {-1, -1};
+    int           nb[2] = {3, 3};
+
+    ASSERT_EQ(tinyllm_allocate_sequence(h.get(), 0, 64), 0);
+    EXPECT_EQ(tinyllm_step(h.get(), seq_ids, prompt.data(), pos0.data(), seq_lens, kBlocks.data(),
+                           nb, pre, 2, next, nullptr, 0, seq_status),
+              0);
+    EXPECT_EQ(seq_status[0], TLLM_SEQ_OK);
+    EXPECT_EQ(seq_status[1], TLLM_SEQ_ERR);
+    EXPECT_GE(next[0], 0);
     EXPECT_EQ(tinyllm_free_sequence(h.get(), 0), 0);
 }
 
@@ -571,9 +647,10 @@ TEST_F(FfiPagedDispatchTest, TinyLlmLoadRejectsMismatchedGeometry) {
     EXPECT_NE(std::string(err).find("hidden_dim"), std::string::npos) << err;
 }
 
-// positions 不再被静默忽略：prefill 必须是 0..len-1，decode 必须等于后端
-// 内部位置计数，decode 的 seq_len 必须为 1。校验在任何 kernel 之前返回。
-TEST_F(FfiPagedDispatchTest, TinyLlmStepRejectsMismatchedPositions) {
+// ABI v3：positions 为惰性参数（后端 SeqState 内部跟踪）——与后端记账
+// 不一致的值不再导致失败；decode 的 seq_len != 1 仍是违约，但只记逐序列
+// 失败（seq_status）、不株连 batch，也不消耗 token 切片。
+TEST_F(FfiPagedDispatchTest, TinyLlmStepInertPositionsAndPerSeqLenCheck) {
     auto h = loadPaged(model_path_.c_str());
     ASSERT_NE(h, nullptr);
     ASSERT_EQ(tinyllm_allocate_sequence(h.get(), 0, kPromptLen + 8), 0);
@@ -584,31 +661,31 @@ TEST_F(FfiPagedDispatchTest, TinyLlmStepRejectsMismatchedPositions) {
     unsigned char    pre[] = {1};
     std::vector<int> blocks = kBlocks;
 
-    // prefill 位置不是从 0 开始
+    // positions 惰性：prefill 位置不从 0 开始不影响调用与本序列状态
     pos[0] = 1;
-    EXPECT_NE(tinyllm_step(h.get(), seq_ids, prompt.data(), pos.data(), seq_lens, blocks.data(),
-                           &nb, pre, 1, &next, nullptr, 0),
+    EXPECT_EQ(tinyllm_step(h.get(), seq_ids, prompt.data(), pos.data(), seq_lens, blocks.data(),
+                           &nb, pre, 1, &next, nullptr, 0, seq_status),
               0);
+    EXPECT_EQ(seq_status[0], TLLM_SEQ_OK);
 
-    // 恢复合法 prefill，再验证 decode 位置与 seq_len
-    pos = promptPositions();
-    ASSERT_EQ(tinyllm_step(h.get(), seq_ids, prompt.data(), pos.data(), seq_lens, blocks.data(),
-                           &nb, pre, 1, &next, nullptr, 0),
-              0);
     int           tok = kFeedToken;
-    int           len1[] = {1}, need = 3;
+    int           len1[] = {1}, need = 4;
     unsigned char dec[] = {0};
 
+    // decode 位置与后端记账不一致同样被忽略（SeqState 权威）
     int wrong_pos = kPromptLen + 1;
-    EXPECT_NE(tinyllm_step(h.get(), seq_ids, &tok, &wrong_pos, len1, blocks.data(), &need, dec, 1,
-                           &next, nullptr, 0),
+    EXPECT_EQ(tinyllm_step(h.get(), seq_ids, &tok, &wrong_pos, len1, blocks.data(), &need, dec, 1,
+                           &next, nullptr, 0, seq_status),
               0);
+    EXPECT_EQ(seq_status[0], TLLM_SEQ_OK);
 
-    int good_pos = kPromptLen;
+    // decode 的 seq_len != 1：调用级仍 TLLM_OK，本序列记失败
+    int good_pos = kPromptLen + 1;
     int len2[] = {2};
-    EXPECT_NE(tinyllm_step(h.get(), seq_ids, &tok, &good_pos, len2, blocks.data(), &need, dec, 1,
-                           &next, nullptr, 0),
+    EXPECT_EQ(tinyllm_step(h.get(), seq_ids, &tok, &good_pos, len2, blocks.data(), &need, dec, 1,
+                           &next, nullptr, 0, seq_status),
               0);
+    EXPECT_EQ(seq_status[0], TLLM_SEQ_ERR);
 
     EXPECT_EQ(tinyllm_free_sequence(h.get(), 0), 0);
 }
