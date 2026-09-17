@@ -1,10 +1,18 @@
-// C ABI 实现：paged-serving 与 tiny-llm 的执行后端桥接。
+// C ABI 实现：paged-serving 与 tiny-llm 的执行后端桥接（ABI v3）。
 //
 // 策略 2（连续 KV）：block_tables 忽略；序列位置由引擎内部跟踪
 // （KV 写入位置以 slot.current_len 为准，与调用方传入 position 解耦）。
 // 逐序列执行（step 的第 s 项对应 seq_id = s），多序列语义正确。
 // 正常 greedy 请求把末端 RMSNorm / LM head / argmax 组成 device batch，并在 step
 // 末尾一次性回传；Transformer layer 的计算融合仍是后续里程碑。
+//
+// ABI v3：tinyllm_step 带 `seq_status` 出参做逐序列归因——单序列失败
+// 标记 seq_status[s]=TLLM_SEQ_ERR 并继续处理其余序列，不再整批失败。
+// 返回值仅表达调用级违约（空指针/范围非法/内部缓冲失败）。
+//
+// 策略 1 的 decode 默认启用 CUDA Graph（TLLM_FFI_CUDA_GRAPHS=0 关闭）：
+// embed + 逐层 forwardPaged 记录为一张 handle 级 graph（地址绑定共享缓冲，
+// 序列差异由每步 H2D 内容表达），首次 decode 先直接执行再捕获，其后重放。
 
 #include "tiny_llm/ffi.h"
 #include "elementwise.cuh"
@@ -76,6 +84,10 @@ struct TinyLlmHandleImpl {
     // GPU 内存永久泄漏。unique_ptr<TinyLlmHandleImpl> 在失败路径离开作用域
     // 时由本析构统一回收。
     ~TinyLlmHandleImpl() {
+        // FFI decode graph（exec 先于 graph 销毁）
+        if (ffi_graph_exec != nullptr) cudaGraphExecDestroy(ffi_graph_exec);
+        if (ffi_decode_graph != nullptr) cudaGraphDestroy(ffi_decode_graph);
+        if (g_hidden_row) cudaFree(g_hidden_row);
         if (rope_cos) cudaFree(rope_cos);
         if (rope_sin) cudaFree(rope_sin);
         if (hidden_buf) cudaFree(hidden_buf);
@@ -87,6 +99,25 @@ struct TinyLlmHandleImpl {
         if (stream) cudaStreamDestroy(stream);
         tiny_llm::ModelLoader::freeWeights(weights);
     }
+
+    // ── FFI decode CUDA Graph（仅策略 1 的 decode；TLLM_FFI_CUDA_GRAPHS=0 关闭）──
+    // 设计：所有 graph 固化的地址均为 handle 级共享缓冲（token_in / rope_pos /
+    // decode_len / d_block_tables / g_hidden_row），graph 只绑定地址不绑定
+    // 内容，因此同一张 graph 可服务任意 seq_id 的 decode——序列差异完全由
+    // 每步 H2D 上传的内容表达。策略 2（连续 KV）的 appendKV 以 host seq_id
+    // 为参数，不可重放，不在本机制范围内。
+    bool                        ffi_graphs_enabled = false;
+    bool                        ffi_graph_captured = false;
+    cudaGraph_t                 ffi_decode_graph = nullptr;
+    cudaGraphExec_t             ffi_graph_exec = nullptr;
+    tiny_llm::DeviceBuffer<int> g_token_in;             // [1] decode 输入 token（地址固定）
+    tiny_llm::DeviceBuffer<int> g_decode_len;           // [1] decode 可见长度（append 后）
+    tiny_llm::DeviceBuffer<int> g_rope_pos;             // [1] decode 绝对位置
+    half                       *g_hidden_row = nullptr; // [hidden] graph 固定工作行
+    // H2D 源（成员变量保证 host 指针跨调用稳定）
+    int g_tok_host = 0;
+    int g_len_host = 0;
+    int g_pos_host = 0;
 };
 
 // ── 内部工具 ─────────────────────────────────────────────
@@ -129,6 +160,94 @@ void queue_hidden_for_batch(TinyLlmHandleImpl *h, half *hidden, int batch_index)
     CUDA_CHECK(cudaMemcpyAsync(h->d_batch_hidden.data() + offset, hidden,
                                static_cast<size_t>(h->config.hidden_dim) * sizeof(half),
                                cudaMemcpyDeviceToDevice, h->stream));
+}
+
+// 策略 1 decode 的可捕获 device 路径：embed → 逐层 forwardPaged。
+// 只含 kernel/memcpy（可捕获）；块表上传、参数 H2D、hidden 出列、
+// position 推进均在 capture 之外由调用方驱动。
+// 要求 view.position_dev / view.decode_len 指向 graph 稳定 device int，
+// 使 scatter/gather 的位置与可见长度在重放时从 device 内存读取。
+tiny_llm::Result<void> runFfiPagedDecode(TinyLlmHandleImpl                *h,
+                                         const tiny_llm::PagedKVCacheView &view) {
+    tiny_llm::kernels::gather_embeddings(h->g_token_in.data(), h->weights.token_embedding,
+                                         h->g_hidden_row, 1, h->config.hidden_dim,
+                                         h->config.vocab_size, h->stream);
+    for (auto &layer : h->layers) {
+        auto r = layer->forwardPaged(h->g_hidden_row, view, 1, h->g_rope_pos.data(), h->rope_cos,
+                                     h->rope_sin, h->stream);
+        if (r.isErr()) {
+            return r;
+        }
+    }
+    return tiny_llm::Result<void>::ok();
+}
+
+// 策略 1 decode：graph 已捕获则重放；未捕获则先直接执行本步，再捕获并实例化
+// （capture 不执行 kernel，本步结果来自直接执行）。任何捕获失败都关闭
+// ffi_graphs_enabled 回退常规路径，不让 capture 异常毒化后续步骤。
+tiny_llm::Result<void> runFfiPagedDecodeGraphed(TinyLlmHandleImpl                *h,
+                                                const tiny_llm::PagedKVCacheView &view) {
+    if (h->ffi_graphs_enabled && h->ffi_graph_captured) {
+        CUDA_CHECK(cudaGraphLaunch(h->ffi_graph_exec, h->stream));
+        return tiny_llm::Result<void>::ok();
+    }
+    if (!h->ffi_graphs_enabled) {
+        return runFfiPagedDecode(h, view);
+    }
+
+    // 首次 decode：直接执行本步，同步后捕获一张新 graph。
+    auto direct = runFfiPagedDecode(h, view);
+    if (direct.isErr()) {
+        return direct;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(h->stream));
+
+    bool capture_ok = false;
+    try {
+        cudaError_t begin_err = cudaStreamBeginCapture(h->stream, cudaStreamCaptureModeThreadLocal);
+        if (begin_err == cudaSuccess) {
+            auto        capture_result = runFfiPagedDecode(h, view);
+            cudaError_t end_err = cudaStreamEndCapture(h->stream, &h->ffi_decode_graph);
+            capture_ok = capture_result.isOk() && end_err == cudaSuccess;
+            if (!capture_ok && h->ffi_decode_graph != nullptr) {
+                cudaGraphDestroy(h->ffi_decode_graph);
+                h->ffi_decode_graph = nullptr;
+            }
+        }
+    } catch (const tiny_llm::CudaException &) {
+        // capture 期间的 CUDA 异常必须结束 capture，否则 stream 停在 capture 态。
+        cudaStreamEndCapture(h->stream, &h->ffi_decode_graph);
+        if (h->ffi_decode_graph != nullptr) {
+            cudaGraphDestroy(h->ffi_decode_graph);
+            h->ffi_decode_graph = nullptr;
+        }
+        capture_ok = false;
+    }
+
+    if (!capture_ok) {
+        if (std::getenv("TLLM_FFI_DEBUG")) {
+            fprintf(stderr, "  [ffi] paged decode graph capture failed; falling back\n");
+        }
+        h->ffi_graphs_enabled = false;
+        return tiny_llm::Result<void>::ok(); // 本步已由直接执行完成
+    }
+    cudaError_t inst_err =
+        cudaGraphInstantiate(&h->ffi_graph_exec, h->ffi_decode_graph, nullptr, nullptr, 0);
+    if (inst_err != cudaSuccess) {
+        if (std::getenv("TLLM_FFI_DEBUG")) {
+            fprintf(stderr, "  [ffi] paged decode graph instantiate failed: %s\n",
+                    cudaGetErrorString(inst_err));
+        }
+        cudaGraphDestroy(h->ffi_decode_graph);
+        h->ffi_decode_graph = nullptr;
+        h->ffi_graphs_enabled = false;
+        return tiny_llm::Result<void>::ok();
+    }
+    h->ffi_graph_captured = true;
+    if (std::getenv("TLLM_FFI_DEBUG")) {
+        fprintf(stderr, "  [ffi] paged decode graph captured\n");
+    }
+    return tiny_llm::Result<void>::ok();
 }
 
 /// 对最后一步采样的 logits 计算 top-k (token_id, logprob)，写入交错数组。
@@ -292,6 +411,20 @@ TinyLlmHandle *tinyllm_load(const char *model_path, const TinyLlmConfig *config,
             CUDA_CHECK(cudaMalloc(&h->paged_k_scratch, scratch_elems * sizeof(half)));
             CUDA_CHECK(cudaMalloc(&h->paged_v_scratch, scratch_elems * sizeof(half)));
             h->d_block_tables = tiny_llm::DeviceBuffer<int>(static_cast<size_t>(h->max_num_blocks));
+
+            // 策略 1 decode 的固定地址缓冲：无论是否启用 graph，decode 路径
+            // 都经 g_* 缓冲执行（graph 只是其上的捕获/重放优化）。
+            h->g_token_in = tiny_llm::DeviceBuffer<int>(1);
+            h->g_decode_len = tiny_llm::DeviceBuffer<int>(1);
+            h->g_rope_pos = tiny_llm::DeviceBuffer<int>(1);
+            CUDA_CHECK(cudaMalloc(&h->g_hidden_row,
+                                  static_cast<size_t>(h->config.hidden_dim) * sizeof(half)));
+
+            // TLLM_FFI_CUDA_GRAPHS=0 显式关闭 decode graph 捕获/重放；
+            // 常规 device 路径不受影响。
+            const char *graph_env = std::getenv("TLLM_FFI_CUDA_GRAPHS");
+            h->ffi_graphs_enabled =
+                !(graph_env != nullptr && graph_env[0] == '0' && graph_env[1] == '\0');
         } else {
             // 策略 2：连续 KV（KVCacheManager）
             tiny_llm::KVCacheConfig kv_config;
@@ -411,10 +544,12 @@ int tinyllm_free_sequence(TinyLlmHandle *handle, int seq_id) {
 int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tokens,
                  const int *positions, const int *seq_lens, const int *block_tables,
                  const int *num_blocks, const unsigned char *is_prefill, int num_sequences,
-                 int *next_tokens, float *logprobs, int logprobs_k) {
-    if (handle == nullptr || seq_ids == nullptr || input_tokens == nullptr ||
-        positions == nullptr || seq_lens == nullptr || is_prefill == nullptr ||
-        next_tokens == nullptr || num_sequences <= 0) {
+                 int *next_tokens, float *logprobs, int logprobs_k, int *seq_status) {
+    // ABI v3：seq_status 为必填出参；调用级违约才返回 TLLM_ERR，
+    // 逐序列结果写入 seq_status（TLLM_SEQ_OK / TLLM_SEQ_ERR）。
+    if (handle == nullptr || seq_ids == nullptr || input_tokens == nullptr || seq_lens == nullptr ||
+        is_prefill == nullptr || next_tokens == nullptr || seq_status == nullptr ||
+        num_sequences <= 0) {
         return TLLM_ERR;
     }
     auto     *h = reinterpret_cast<TinyLlmHandleImpl *>(handle);
@@ -424,6 +559,10 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
     if (logprobs_k < 0 || logprobs_k > h->config.vocab_size ||
         (logprobs_k > 0 && logprobs == nullptr)) {
         return TLLM_ERR;
+    }
+
+    for (int s = 0; s < num_sequences; ++s) {
+        seq_status[s] = TLLM_SEQ_ERR;
     }
 
     const bool batch_device_postprocess = logprobs_k == 0;
@@ -446,28 +585,26 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
 
     int offset = 0;
     int table_offset = 0; // 扁平化 block_tables 中前面序列块数之和（策略 1）
+    int ok_count = 0;
     for (int s = 0; s < num_sequences; ++s) {
         const int len = seq_lens[s];
-        if (len <= 0) return TLLM_ERR;
+        if (len <= 0) {
+            continue; // 非法长度：本序列失败，不消耗 token 切片
+        }
+        // decode 必须恰好 1 个 token；ABI v3 下同样不消耗切片、仅记本序列
+        // 失败（seq_status 保持 TLLM_SEQ_ERR），不株连 batch。
+        if (!is_prefill[s] && len != 1) continue;
         const int seq_id = seq_ids[s];
         auto      it = h->sequences.find(seq_id);
-        if (it == h->sequences.end() || !it->second.allocated) return TLLM_ERR;
+        if (it == h->sequences.end() || !it->second.allocated) {
+            continue; // 未分配/已释放的 seq_id：本序列失败
+        }
         auto &st = it->second;
 
         const int *toks = input_tokens + offset;
-        const int *poses = positions + offset;
         offset += len;
 
-        // positions 不再静默忽略：prefill 必须是从 0 开始的连续绝对位置，
-        // decode 必须等于后端内部位置计数（即调用方的 context_len - 1）。
-        // 不一致说明调用方与后端对上下文长度的记账已经分叉，继续执行会把
-        // token 写到错误的 RoPE 位置 / KV 槽位而不报错。
-        if (!is_prefill[s] && len != 1) return TLLM_ERR;
-        for (int i = 0; i < len; ++i) {
-            const int expected = is_prefill[s] ? i : st.position;
-            if (poses[i] != expected) return TLLM_ERR;
-        }
-
+        bool seq_ok = false;
         try {
             if (std::getenv("TLLM_FFI_DEBUG") && !h->paged_kv) {
                 auto c = h->kv_cache->getCache(seq_id, 0);
@@ -477,20 +614,42 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
             }
             if (h->paged_kv) {
                 // ── 策略 1：分页 KV ──
-                // 前置校验：块表/计数非空，每序列块数合法且足以容纳本步。
-                if (block_tables == nullptr || num_blocks == nullptr) return TLLM_ERR;
-                const int nb = num_blocks[s];
-                if (nb <= 0 || nb > h->max_num_blocks) return TLLM_ERR;
+                // 先按调用方 num_blocks 推进 table_offset（扁平化布局对齐），
+                // 再做本序列校验——校验失败不再连累后续序列的块表切片。
+                const int *bt = nullptr;
+                int        nb = 0;
+                if (num_blocks != nullptr && block_tables != nullptr) {
+                    nb = num_blocks[s];
+                    if (nb > 0) {
+                        bt = block_tables + table_offset;
+                        table_offset += nb;
+                    }
+                }
+                if (bt == nullptr || nb <= 0 || nb > h->max_num_blocks) {
+                    goto seq_done; // 块表缺失/块数非法
+                }
                 const int block_size = h->block_size;
-                const int cur_pos = is_prefill[s] ? 0 : st.position;
-                const int need_blocks = is_prefill[s] ? (len + block_size - 1) / block_size
-                                                      : (cur_pos + 1 + block_size - 1) / block_size;
-                if (nb < need_blocks) return TLLM_ERR;
+                {
+                    // host 侧块 id 值域校验：坏块表必须显式失败，而不是依赖
+                    // kernel 的值域防护把错误吞成静默错误输出。
+                    bool bad_block = false;
+                    for (int i = 0; i < nb; ++i) {
+                        if (bt[i] < 0 || bt[i] >= h->max_num_blocks) {
+                            bad_block = true;
+                            break;
+                        }
+                    }
+                    const int cur_pos = is_prefill[s] ? 0 : st.position;
+                    const int need_blocks = is_prefill[s]
+                                                ? (len + block_size - 1) / block_size
+                                                : (cur_pos + 1 + block_size - 1) / block_size;
+                    if (bad_block || nb < need_blocks) {
+                        goto seq_done;
+                    }
+                }
 
                 // 块表上传（逐序列，同一 stream 上顺序执行）
-                h->d_block_tables.copyFromHost(block_tables + table_offset, static_cast<size_t>(nb),
-                                               h->stream);
-                table_offset += nb;
+                h->d_block_tables.copyFromHost(bt, static_cast<size_t>(nb), h->stream);
 
                 // 构造视图
                 tiny_llm::PagedKVCacheView view;
@@ -507,28 +666,34 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
                 if (is_prefill[s]) {
                     // 修复：prefill 长度必须 <= max_seq_len，否则 hidden_buf /
                     // RoPE 表越界（hidden_buf 按 max_seq_len 分配）。
-                    if (len > h->config.max_seq_len) return TLLM_ERR;
+                    if (len > h->config.max_seq_len) goto seq_done;
                     // R5: 不支持对同一序列二次 prefill（KV 从位置 0 重写覆盖
                     // 旧上下文、current_len 双倍累加会静默错乱），显式拒绝。
-                    if (st.position != 0) return TLLM_ERR;
+                    if (st.position != 0) goto seq_done;
                     // Prefill：从绝对位置 0 写入整个 prompt
                     view.position = 0;
                     view.decode_len = nullptr;
                     const int zero_pos = 0;
                     h->rope_pos.copyFromHost(&zero_pos, 1, h->stream);
                     embed(h, toks, len, h->hidden_buf);
-                    int li = 0;
-                    for (auto &layer : h->layers) {
-                        auto r = layer->forwardPaged(h->hidden_buf, view, len, h->rope_pos.data(),
-                                                     h->rope_cos, h->rope_sin, h->stream);
-                        if (r.isErr()) {
-                            if (std::getenv("TLLM_FFI_DEBUG")) {
-                                fprintf(stderr, "  [ffi] paged layer %d err: %s\n", li,
-                                        r.error().c_str());
+                    {
+                        int  li = 0;
+                        bool layer_ok = true;
+                        for (auto &layer : h->layers) {
+                            auto r =
+                                layer->forwardPaged(h->hidden_buf, view, len, h->rope_pos.data(),
+                                                    h->rope_cos, h->rope_sin, h->stream);
+                            if (r.isErr()) {
+                                if (std::getenv("TLLM_FFI_DEBUG")) {
+                                    fprintf(stderr, "  [ffi] paged layer %d err: %s\n", li,
+                                            r.error().c_str());
+                                }
+                                layer_ok = false;
+                                break;
                             }
-                            return TLLM_ERR;
+                            ++li;
                         }
-                        ++li;
+                        if (!layer_ok) goto seq_done;
                     }
                     if (batch_device_postprocess) {
                         queue_hidden_for_batch(h, h->hidden_buf + (len - 1) * hidden, s);
@@ -536,97 +701,97 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
                         next_tokens[s] = sample_from_hidden(h, h->hidden_buf + (len - 1) * hidden);
                     }
                     st.position = len;
+                    seq_ok = true;
                 } else {
-                    // Decode：单个新 token（绝对位置 = st.position）
+                    // Decode：单个新 token（绝对位置 = st.position）。
+                    // 工作行使用 graph 固定地址 g_hidden_row，scatter/gather
+                    // 的位置与可见长度走 device int——同一张 graph 可重放
+                    // 任意序列的 decode。
                     const int pos = st.position;
-                    // 修复：绝对位置必须 < max_seq_len，否则 hidden_buf 写入
-                    // 与 RoPE cos/sin 表读取越界。
-                    if (pos >= h->config.max_seq_len) return TLLM_ERR;
-                    const int visible = pos + 1;
-                    h->decode_len.copyFromHost(&visible, 1, h->stream);
-                    h->rope_pos.copyFromHost(&pos, 1, h->stream);
-                    embed(h, toks, 1, h->hidden_buf + static_cast<size_t>(pos) * hidden);
-                    half *token_state = h->hidden_buf + static_cast<size_t>(pos) * hidden;
-                    view.position = pos;
-                    view.decode_len = h->decode_len.data();
-                    int li = 0;
-                    for (auto &layer : h->layers) {
-                        auto r = layer->forwardPaged(token_state, view, 1, h->rope_pos.data(),
-                                                     h->rope_cos, h->rope_sin, h->stream);
-                        if (r.isErr()) {
-                            if (std::getenv("TLLM_FFI_DEBUG")) {
-                                fprintf(stderr, "  [ffi] paged decode layer %d err: %s\n", li,
-                                        r.error().c_str());
-                            }
-                            return TLLM_ERR;
-                        }
-                        ++li;
-                    }
+                    // 修复：绝对位置必须 < max_seq_len（RoPE 表越界防护）。
+                    if (pos >= h->config.max_seq_len) goto seq_done;
+                    h->g_tok_host = toks[0];
+                    h->g_len_host = pos + 1;
+                    h->g_pos_host = pos;
+                    h->g_token_in.copyFromHost(&h->g_tok_host, 1, h->stream);
+                    h->g_decode_len.copyFromHost(&h->g_len_host, 1, h->stream);
+                    h->g_rope_pos.copyFromHost(&h->g_pos_host, 1, h->stream);
+                    view.position = pos;                      // host 校验仍用
+                    view.position_dev = h->g_rope_pos.data(); // scatter 走 device
+                    view.decode_len = h->g_decode_len.data(); // gather/可见长度走 device
+                    if (runFfiPagedDecodeGraphed(h, view).isErr()) goto seq_done;
                     if (batch_device_postprocess) {
-                        queue_hidden_for_batch(h, token_state, s);
+                        queue_hidden_for_batch(h, h->g_hidden_row, s);
                     } else {
-                        next_tokens[s] = sample_from_hidden(h, token_state);
+                        next_tokens[s] = sample_from_hidden(h, h->g_hidden_row);
                     }
                     st.position = pos + 1;
+                    seq_ok = true;
                 }
             } else if (is_prefill[s]) {
                 // Prefill：处理完整 prompt，输出最后一个 hidden 的下一 token
                 // 修复：prefill 长度必须 <= max_seq_len（hidden_buf 越界防护）。
-                if (len > h->config.max_seq_len) return TLLM_ERR;
+                if (len > h->config.max_seq_len) goto seq_done;
                 // R5: 不支持对同一序列二次 prefill（KV 从位置 0 重写覆盖旧
                 // 上下文、advanceSeqLen 累加后 decode 错乱），显式拒绝。
-                if (st.position != 0) return TLLM_ERR;
-                bool dbg = std::getenv("TLLM_FFI_DEBUG") != nullptr;
-                embed(h, toks, len, h->hidden_buf);
-                if (dbg) {
-                    cudaError_t e = cudaGetLastError();
-                    fprintf(stderr, "  [ffi] embed: %s\n", cudaGetErrorString(e));
-                }
-                // 任务 3.2：prefill 起始位置 0、append 写位置 = 当前可见长度
-                const int zero_pos = 0;
-                h->rope_pos.copyFromHost(&zero_pos, 1, h->stream);
-                h->kv_cache->setAppendPos(0, h->stream);
-                int li = 0;
-                for (auto &layer : h->layers) {
-                    auto r = [&]() -> tiny_llm::Result<void> {
-                        try {
-                            return layer->forwardPrefill(h->hidden_buf, *h->kv_cache, seq_id, len,
-                                                         h->rope_pos.data(), h->rope_cos,
-                                                         h->rope_sin, h->stream);
-                        } catch (const std::exception &e) {
-                            if (std::getenv("TLLM_FFI_DEBUG")) {
-                                fprintf(stderr, "  [ffi] layer %d threw: %s\n", li, e.what());
-                            }
-                            return tiny_llm::Result<void>::err(std::string("threw: ") + e.what());
-                        }
-                    }();
-                    if (r.isErr()) {
-                        if (std::getenv("TLLM_FFI_DEBUG")) {
-                            fprintf(stderr, "  [ffi] layer %d forwardPrefill err: %s\n", li,
-                                    r.error().c_str());
-                        }
-                        return TLLM_ERR;
-                    }
+                if (st.position != 0) goto seq_done;
+                {
+                    bool dbg = std::getenv("TLLM_FFI_DEBUG") != nullptr;
+                    embed(h, toks, len, h->hidden_buf);
                     if (dbg) {
-                        cudaError_t e = cudaDeviceSynchronize();
-                        fprintf(stderr, "  [ffi] layer %d: %s\n", li, cudaGetErrorString(e));
-                        if (e != cudaSuccess) break;
+                        cudaError_t e = cudaGetLastError();
+                        fprintf(stderr, "  [ffi] embed: %s\n", cudaGetErrorString(e));
                     }
-                    ++li;
+                    // 任务 3.2：prefill 起始位置 0、append 写位置 = 当前可见长度
+                    const int zero_pos = 0;
+                    h->rope_pos.copyFromHost(&zero_pos, 1, h->stream);
+                    h->kv_cache->setAppendPos(0, h->stream);
+                    int  li = 0;
+                    bool layer_ok = true;
+                    for (auto &layer : h->layers) {
+                        auto r = [&]() -> tiny_llm::Result<void> {
+                            try {
+                                return layer->forwardPrefill(h->hidden_buf, *h->kv_cache, seq_id,
+                                                             len, h->rope_pos.data(), h->rope_cos,
+                                                             h->rope_sin, h->stream);
+                            } catch (const std::exception &e) {
+                                if (std::getenv("TLLM_FFI_DEBUG")) {
+                                    fprintf(stderr, "  [ffi] layer %d threw: %s\n", li, e.what());
+                                }
+                                return tiny_llm::Result<void>::err(std::string("threw: ") +
+                                                                   e.what());
+                            }
+                        }();
+                        if (r.isErr()) {
+                            if (std::getenv("TLLM_FFI_DEBUG")) {
+                                fprintf(stderr, "  [ffi] layer %d forwardPrefill err: %s\n", li,
+                                        r.error().c_str());
+                            }
+                            layer_ok = false;
+                            break;
+                        }
+                        if (dbg) {
+                            cudaError_t e = cudaDeviceSynchronize();
+                            fprintf(stderr, "  [ffi] layer %d: %s\n", li, cudaGetErrorString(e));
+                            if (e != cudaSuccess) break;
+                        }
+                        ++li;
+                    }
+                    if (!layer_ok) goto seq_done;
                 }
-                auto adv = h->kv_cache->advanceSeqLen(seq_id, len);
-                if (adv.isErr()) return TLLM_ERR;
+                if (h->kv_cache->advanceSeqLen(seq_id, len).isErr()) goto seq_done;
                 if (batch_device_postprocess) {
                     queue_hidden_for_batch(h, h->hidden_buf + (len - 1) * hidden, s);
                 } else {
                     next_tokens[s] = sample_from_hidden(h, h->hidden_buf + (len - 1) * hidden);
                 }
                 st.position = len;
+                seq_ok = true;
             } else {
                 // Decode：单个新 token（绝对位置由引擎跟踪，与 KV 写入一致）
                 const int pos = st.position;
                 // 修复：绝对位置必须 < max_seq_len（hidden_buf / RoPE 表越界防护）。
-                if (pos >= h->config.max_seq_len) return TLLM_ERR;
+                if (pos >= h->config.max_seq_len) goto seq_done;
                 embed(h, toks, 1, h->hidden_buf + static_cast<size_t>(pos) * hidden);
                 half *token_state = h->hidden_buf + static_cast<size_t>(pos) * hidden;
                 // 任务 3.1/3.2：把 appendKV 后的可见长度、RoPE 位置与
@@ -635,31 +800,44 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
                 h->decode_len.copyFromHost(&decode_len, 1, h->stream);
                 h->rope_pos.copyFromHost(&pos, 1, h->stream);
                 h->kv_cache->setAppendPos(h->kv_cache->getSeqLen(seq_id), h->stream);
-                for (auto &layer : h->layers) {
-                    auto r =
-                        layer->forward(token_state, *h->kv_cache, seq_id, pos, h->decode_len.data(),
-                                       h->rope_pos.data(), h->rope_cos, h->rope_sin, h->stream);
-                    if (r.isErr()) return TLLM_ERR;
+                {
+                    bool layer_ok = true;
+                    for (auto &layer : h->layers) {
+                        auto r = layer->forward(token_state, *h->kv_cache, seq_id, pos,
+                                                h->decode_len.data(), h->rope_pos.data(),
+                                                h->rope_cos, h->rope_sin, h->stream);
+                        if (r.isErr()) {
+                            layer_ok = false;
+                            break;
+                        }
+                    }
+                    if (!layer_ok) goto seq_done;
                 }
-                auto adv = h->kv_cache->advanceSeqLen(seq_id, 1);
-                if (adv.isErr()) return TLLM_ERR;
+                if (h->kv_cache->advanceSeqLen(seq_id, 1).isErr()) goto seq_done;
                 if (batch_device_postprocess) {
                     queue_hidden_for_batch(h, token_state, s);
                 } else {
                     next_tokens[s] = sample_from_hidden(h, token_state);
                 }
                 st.position = pos + 1;
+                seq_ok = true;
             }
         } catch (...) {
-            return TLLM_ERR;
+            seq_ok = false;
         }
 
-        if (logprobs_k > 0 && logprobs != nullptr) {
-            compute_logprobs(h, s, logprobs_k, logprobs);
+    seq_done:
+        if (seq_ok) {
+            seq_status[s] = TLLM_SEQ_OK;
+            ++ok_count;
+            if (logprobs_k > 0 && logprobs != nullptr) {
+                compute_logprobs(h, s, logprobs_k, logprobs);
+            }
         }
     }
 
-    if (batch_device_postprocess) {
+    // 全部序列失败时跳过批量后处理（next_tokens 无有效槽位）。
+    if (batch_device_postprocess && ok_count > 0) {
         try {
             tiny_llm::finalNormAndComputeLogitsBatch(h->d_batch_hidden.data(), num_sequences,
                                                      h->weights, h->config,
@@ -676,9 +854,12 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
         }
     }
 
-    (void)positions;    // 策略 2：位置由引擎内部跟踪（策略 1 不使用 positions）
-    (void)block_tables; // 策略 2：连续 KV，忽略分页表（策略 1 已在循环内使用）
-    (void)num_blocks; // 策略 2：连续 KV，忽略逐序列块计数（策略 1 已在循环内使用）
+    // positions 当前两种策略均不使用（序列位置由后端 SeqState 内部跟踪；
+    // 见 ffi.h"已声明但未生效的参数"）。block_tables/num_blocks 仅策略 1
+    // 在循环内使用，策略 2 忽略。
+    (void)positions;
+    (void)block_tables;
+    (void)num_blocks;
     return TLLM_OK;
 }
 

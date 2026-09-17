@@ -55,8 +55,12 @@ struct PagedKVCacheView {
     int        block_size = 0;
     int        max_num_blocks = 0;
     int        max_visible_tokens = 0;
-    int        position = 0;         // 本步首 token 的绝对位置
+    int        position = 0;         // 本步首 token 的绝对位置（host 校验用）
     const int *decode_len = nullptr; // decode 专用 device int；prefill 传 nullptr
+    // decode 专用 device int：本 token 绝对位置。非空时 scatter/gather 的位置
+    // 与可见长度改从 device 内存读取（CUDA Graph 可重放）；prefill 传 nullptr
+    // 走 host 标量路径。
+    const int *position_dev = nullptr;
 };
 
 // TransformerLayer implements a single transformer decoder layer

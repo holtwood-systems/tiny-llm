@@ -21,5 +21,16 @@ void paged_gather_blocks(half *dst, const half *pool, const int *block_table, in
                          int block_size, int chunk_dim, int max_num_blocks,
                          cudaStream_t stream = 0);
 
+// device 参数变体（CUDA Graph 可重放）：scatter 的起始绝对位置、
+// gather 的可见长度从 device int 读取，graph 重放时随 H2D 更新生效。
+// gather_dev 的 grid 按 max_visible_tokens 满配发射（kernel 内早退）。
+void paged_scatter_blocks_dev(const half *src, half *pool, const int *block_table, int num_tokens,
+                              const int *position_dev, int block_size, int chunk_dim,
+                              int max_num_blocks, cudaStream_t stream = 0);
+
+void paged_gather_blocks_dev(half *dst, const half *pool, const int *block_table,
+                             const int *visible_dev, int block_size, int chunk_dim,
+                             int max_num_blocks, int max_visible_tokens, cudaStream_t stream = 0);
+
 } // namespace kernels
 } // namespace tiny_llm

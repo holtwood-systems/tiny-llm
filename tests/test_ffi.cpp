@@ -22,6 +22,9 @@
 #include <utility>
 #include <vector>
 
+// ABI v3: 逐序列状态出参（本文件测试统一用共享缓冲）
+static int seq_status[256];
+
 namespace {
 
 const char *model_path() {
@@ -118,7 +121,7 @@ TEST(FFITest, LoadAllocateStepFree) {
     int           next = -1;
     float         logprobs[6] = {0.0f};
     ASSERT_EQ(tinyllm_step(h, seq_ids, prompt, positions, seq_lens, nullptr, nullptr, pre, 1, &next,
-                           logprobs, 3),
+                           logprobs, 3, seq_status),
               0);
     ASSERT_GE(next, 0);
     EXPECT_EQ(next, 358) << "Qwen2.5-0.5B 对 \"Hello, how are you?\" 的首生成 token 应为 358"
@@ -134,8 +137,9 @@ TEST(FFITest, LoadAllocateStepFree) {
         int           lens[] = {1};
         unsigned char dec[] = {0};
         int           sid[] = {0};
-        ASSERT_EQ(
-            tinyllm_step(h, sid, &in, &pos, lens, nullptr, nullptr, dec, 1, &next, nullptr, 0), 0);
+        ASSERT_EQ(tinyllm_step(h, sid, &in, &pos, lens, nullptr, nullptr, dec, 1, &next, nullptr, 0,
+                               seq_status),
+                  0);
         ASSERT_GE(next, 0);
         ++pos;
     }
@@ -174,7 +178,7 @@ TEST(FFITest, DeviceGreedyMatchesHostSampling) {
         float        *out_logprobs = logprobs_k > 0 ? logprobs : nullptr;
 
         if (tinyllm_step(h, seq_ids, prompt, positions, seq_lens, nullptr, nullptr, pre, 1, &next,
-                         out_logprobs, logprobs_k) != 0) {
+                         out_logprobs, logprobs_k, seq_status) != 0) {
             ADD_FAILURE() << "prefill failed";
             tinyllm_free(h);
             return std::vector<int>{};
@@ -187,7 +191,7 @@ TEST(FFITest, DeviceGreedyMatchesHostSampling) {
             int           lens[] = {1};
             unsigned char decode[] = {0};
             if (tinyllm_step(h, seq_ids, &input, &pos, lens, nullptr, nullptr, decode, 1, &next,
-                             out_logprobs, logprobs_k) != 0) {
+                             out_logprobs, logprobs_k, seq_status) != 0) {
                 ADD_FAILURE() << "decode step " << step << " failed";
                 tinyllm_free(h);
                 return std::vector<int>{};
@@ -211,7 +215,7 @@ TEST(FFITest, InvalidArgsReturnError) {
     ASSERT_EQ(tinyllm_load(nullptr, nullptr, nullptr, 0), nullptr);
     TinyLlmHandle *h = nullptr;
     ASSERT_EQ(tinyllm_step(h, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0,
-                           nullptr, nullptr, 0),
+                           nullptr, nullptr, 0, seq_status),
               -1);
     ASSERT_EQ(tinyllm_allocate_sequence(h, 0, 0), -1);
     tinyllm_free(nullptr); // 不崩溃
@@ -238,10 +242,10 @@ TEST(FFITest, BatchedLogprobsBufferContract) {
     int           next_tokens[] = {-1, -1};
 
     EXPECT_EQ(tinyllm_step(h, seq_ids, prompt, positions, seq_lens, nullptr, nullptr, prefill, 2,
-                           next_tokens, nullptr, -1),
+                           next_tokens, nullptr, -1, seq_status),
               -1);
     EXPECT_EQ(tinyllm_step(h, seq_ids, prompt, positions, seq_lens, nullptr, nullptr, prefill, 2,
-                           next_tokens, nullptr, 3),
+                           next_tokens, nullptr, 3, seq_status),
               -1);
 
     constexpr int                    k = 3;
@@ -250,7 +254,7 @@ TEST(FFITest, BatchedLogprobsBufferContract) {
     storage.fill(sentinel);
     float *logprobs = storage.data() + 1;
     ASSERT_EQ(tinyllm_step(h, seq_ids, prompt, positions, seq_lens, nullptr, nullptr, prefill, 2,
-                           next_tokens, logprobs, k),
+                           next_tokens, logprobs, k, seq_status),
               0);
 
     EXPECT_EQ(storage.front(), sentinel);
@@ -482,7 +486,7 @@ TEST(FFITest, PagedKVStrategyMatchesContiguous) {
 
     std::vector<int> seq_contig;
     ASSERT_EQ(tinyllm_step(h2, seq_ids, prompt, positions, seq_lens, nullptr, nullptr, pre, 1,
-                           &next, nullptr, 0),
+                           &next, nullptr, 0, seq_status),
               0);
     ASSERT_GE(next, 0);
     seq_contig.push_back(next);
@@ -491,9 +495,9 @@ TEST(FFITest, PagedKVStrategyMatchesContiguous) {
         int           in = next;
         int           lens[] = {1};
         unsigned char dec[] = {0};
-        ASSERT_EQ(
-            tinyllm_step(h2, seq_ids, &in, &pos, lens, nullptr, nullptr, dec, 1, &next, nullptr, 0),
-            0);
+        ASSERT_EQ(tinyllm_step(h2, seq_ids, &in, &pos, lens, nullptr, nullptr, dec, 1, &next,
+                               nullptr, 0, seq_status),
+                  0);
         ASSERT_GE(next, 0);
         seq_contig.push_back(next);
         ++pos;
@@ -511,9 +515,9 @@ TEST(FFITest, PagedKVStrategyMatchesContiguous) {
     std::vector<int> seq_paged;
     int              bt[] = {0};
     int              nb = 1;
-    ASSERT_EQ(
-        tinyllm_step(h1, seq_ids, prompt, positions, seq_lens, bt, &nb, pre, 1, &next, nullptr, 0),
-        0);
+    ASSERT_EQ(tinyllm_step(h1, seq_ids, prompt, positions, seq_lens, bt, &nb, pre, 1, &next,
+                           nullptr, 0, seq_status),
+              0);
     ASSERT_GE(next, 0);
     seq_paged.push_back(next);
     pos = 6;
@@ -521,7 +525,8 @@ TEST(FFITest, PagedKVStrategyMatchesContiguous) {
         int           in = next;
         int           lens[] = {1};
         unsigned char dec[] = {0};
-        ASSERT_EQ(tinyllm_step(h1, seq_ids, &in, &pos, lens, bt, &nb, dec, 1, &next, nullptr, 0),
+        ASSERT_EQ(tinyllm_step(h1, seq_ids, &in, &pos, lens, bt, &nb, dec, 1, &next, nullptr, 0,
+                               seq_status),
                   0);
         ASSERT_GE(next, 0);
         seq_paged.push_back(next);
@@ -545,7 +550,7 @@ TEST(FFITest, PagedKVStrategyMatchesContiguous) {
     ASSERT_NE(h2b, nullptr) << "load failed: " << err;
     ASSERT_EQ(tinyllm_allocate_sequence(h2b, 0, 128), 0);
     ASSERT_EQ(tinyllm_step(h2b, seq_ids, prompt, positions, seq_lens, nullptr, nullptr, pre, 1,
-                           &next, nullptr, 0),
+                           &next, nullptr, 0, seq_status),
               0);
     seq_contig_x.push_back(next);
     pos = 6;
@@ -554,7 +559,7 @@ TEST(FFITest, PagedKVStrategyMatchesContiguous) {
         int           lens[] = {1};
         unsigned char dec[] = {0};
         ASSERT_EQ(tinyllm_step(h2b, seq_ids, &in, &pos, lens, nullptr, nullptr, dec, 1, &next,
-                               nullptr, 0),
+                               nullptr, 0, seq_status),
                   0);
         ASSERT_GE(next, 0);
         seq_contig_x.push_back(next);
@@ -566,9 +571,9 @@ TEST(FFITest, PagedKVStrategyMatchesContiguous) {
     TinyLlmHandle *h1b = tinyllm_load(path, &cfg1, err, sizeof(err));
     ASSERT_NE(h1b, nullptr) << "load failed: " << err;
     ASSERT_EQ(tinyllm_allocate_sequence(h1b, 0, 128), 0);
-    ASSERT_EQ(
-        tinyllm_step(h1b, seq_ids, prompt, positions, seq_lens, bt, &nb, pre, 1, &next, nullptr, 0),
-        0);
+    ASSERT_EQ(tinyllm_step(h1b, seq_ids, prompt, positions, seq_lens, bt, &nb, pre, 1, &next,
+                           nullptr, 0, seq_status),
+              0);
     seq_paged_x.push_back(next);
     int bt2[] = {0, 1};
     int nb2 = 2;
@@ -580,12 +585,13 @@ TEST(FFITest, PagedKVStrategyMatchesContiguous) {
         const int     cur_pos = 6 + i;
         // pos >= 16 需要 2 块；否则 1 块
         if (cur_pos >= 16) {
-            ASSERT_EQ(
-                tinyllm_step(h1b, seq_ids, &in, &pos, lens, bt2, &nb2, dec, 1, &next, nullptr, 0),
-                0);
+            ASSERT_EQ(tinyllm_step(h1b, seq_ids, &in, &pos, lens, bt2, &nb2, dec, 1, &next, nullptr,
+                                   0, seq_status),
+                      0);
         } else {
-            ASSERT_EQ(
-                tinyllm_step(h1b, seq_ids, &in, &pos, lens, bt, &nb, dec, 1, &next, nullptr, 0), 0);
+            ASSERT_EQ(tinyllm_step(h1b, seq_ids, &in, &pos, lens, bt, &nb, dec, 1, &next, nullptr,
+                                   0, seq_status),
+                      0);
         }
         ASSERT_GE(next, 0);
         seq_paged_x.push_back(next);

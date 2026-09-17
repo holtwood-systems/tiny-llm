@@ -4,7 +4,44 @@ All notable tracked releases of Tiny-LLM are recorded here.
 
 ## [Unreleased]
 
+### Breaking Changes（ABI v3）
+
+- `tinyllm_step` 新增必填出参 `int *seq_status`（ABI v2 → v3）。
+  返回值语义收窄：`TLLM_OK` 仅表示调用级执行完成，逐序列结果经
+  `seq_status[i]`（`TLLM_SEQ_OK`/`TLLM_SEQ_ERR`）表达——单个序列失败
+  不再株连整个 batch，且失败序列的 position/KV 不推进（可安全重试或
+  释放）。`TLLM_ERR` 保留给调用级违约（空指针、logprobs_k 越界、
+  内部缓冲分配失败等）。paged-serving 侧 `tiny_llm_ffi.rs` 同步更新，
+  引擎按"调度集合 − 输出集合"归因逐序列失败。
+
 ### Added
+
+- FFI 策略 1 decode 路径接入 **CUDA Graph**：句柄级固定 device buffer
+  （`g_token_in` / `g_decode_len` / `g_rope_pos` / `g_hidden_row`）承载每步
+  token、可见长度与绝对位置；首次 decode 直接执行后在同 stream 捕获
+  embed + 逐层 `forwardPaged`，后续 replay。graph 固化的是地址而非内容，
+  同一张 graph 可重放任意序列的 decode。`TLLM_FFI_CUDA_GRAPHS=0` 显式
+  关闭；捕获/实例化失败自动回退常规路径。**注意：这消除的是 kernel
+  launch 开销，不等于 Transformer 层计算批量化**（layer forward 仍逐
+  序列执行）。
+- `PagedKVCacheView::position_dev`（device int 绝对位置）与
+  `kernels::paged_scatter_blocks_dev` / `paged_gather_blocks_dev`：scatter
+  起始位置与 gather 可见长度改从 device 内存读取，使 decode 路径的
+  paged KV kernel 可被 CUDA Graph 捕获。gather_dev 的 grid 按
+  `max_visible_tokens` 满配发射、kernel 内按 `*visible_dev` 早退
+  （graph 要求固定 launch 形状）。host 标量路径保留给 prefill 与非
+  graph 调用方。
+- `tinyllm_step` 策略 1 块表 host 侧 `block_id` 值域校验：坏块表显式
+  标记该序列 `TLLM_SEQ_ERR`，不再依赖 kernel 的值域防护把控制面 bug
+  吞成静默错误输出。
+- `ffi.h` 契约注释澄清：`positions` 两种策略均不生效（序列位置由后端
+  `SeqState` 内部跟踪）；策略 1 下 `tinyllm_allocate_sequence` 的
+  `num_tokens` 仅登记序列、不参与容量预留（分页容量权威是共享
+  block pool + `max_seq_len`）。
+- `tests/test_ffi_paged_dispatch.cpp` 新增 ABI v3 用例：混合 batch 中
+  一个序列块表不足/未分配时只败自身（`PartialBatchFailureDoesNotCascade`、
+  `UnallocatedSeqIdFailsOnlyItself`），且失败序列 position 不推进、
+  合法重试成功。
 
 - `TLLM_PAGED_ATTENTION` 开关（`auto | legacy | direct`，大小写不敏感）与
   `TransformerLayer::attentionPaged` 的 decode 路由：`direct` 时 decode 直接调用

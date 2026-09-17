@@ -25,6 +25,12 @@ num_heads、num_kv_heads、head_dim、vocab_size）。paged-serving 统一传 0�
   `positions[i] == i`；decode 段 `positions[0] == st.position`。
 - 不一致直接返回 `TLLM_ERR`（无部分执行，因为校验在任何 kernel 之前）。
 
+> **2026-11-09 更新**：以上 positions 校验决定已被 ABI v3 取代——
+> `positions` 恢复为惰性参数，`seq_len != 1` 降级为逐序列失败，
+> 见
+> [2026-11-09-abi-v3-seq-status-graphs](../feature/2026-11-09-abi-v3-seq-status-graphs.md)。
+> 下述 `tinyllm_load` 几何字段校验决定仍然成立。
+
 `tinyllm_load`：
 
 - 6 个几何字段传 0 视为“未指定，采用 GGUF”；非 0 且与
