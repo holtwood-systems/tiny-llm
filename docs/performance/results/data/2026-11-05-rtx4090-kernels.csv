@@ -1,0 +1,14 @@
+name,shape,ms
+w8a16_matmul,M=1,K=896,N=128,0.0032
+w8a16_matmul,M=1,K=896,N=896,0.0038
+w8a16_matmul,M=1,K=896,N=4864,0.0070
+w8a16_matmul,M=1,K=4864,N=896,0.0113
+fp16_matmul,M=1,K=896,N=151936,0.2822
+attention_decode,S=8,Hq=14,Hkv=2,D=64,0.0037
+attention_decode,S=32,Hq=14,Hkv=2,D=64,0.0056
+attention_decode,S=64,Hq=14,Hkv=2,D=64,0.0072
+attention_decode,S=128,Hq=14,Hkv=2,D=64,0.0109
+rmsnorm,batch=1,hidden=896,0.0028
+apply_rope_inplace,tokens=1,Hq=14,Hkv=2,D=64,pos=0,0.0020
+add_inplace,n=896,0.0022
+silu_mul_inplace,n=4864,0.0020
