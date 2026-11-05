@@ -8,6 +8,15 @@ project(tiny-llm
     LANGUAGES CXX
 )
 
+# check_language / enable_language 的编译器检测会把 CMAKE_CUDA_ARCHITECTURES
+# 填成 nvcc 默认（52），必须在此之前捕获用户的显式指定（-D / toolchain），见
+# .agents/notes/implemented/bug-fix/2026-11-05-cuda-arch-default-never-applies.md
+if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(_TLLM_USER_CUDA_ARCH TRUE)
+else()
+    set(_TLLM_USER_CUDA_ARCH FALSE)
+endif()
+
 include(CheckLanguage)
 include(FetchContent)
 check_language(CUDA)
@@ -39,7 +48,7 @@ FetchContent_MakeAvailable(spdlog)
 # ── CUDA 配置 ────────────────────────────────────────────────────
 find_package(CUDAToolkit REQUIRED)
 
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+if(NOT _TLLM_USER_CUDA_ARCH AND NOT DEFINED ENV{CUDAARCHS})
     if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
         set(CMAKE_CUDA_ARCHITECTURES native)
     else()
