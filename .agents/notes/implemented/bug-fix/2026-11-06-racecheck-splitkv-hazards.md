@@ -1,6 +1,6 @@
 # Agent Note: racecheck 在 split-KV 归约路径报 3 hazards 且插桩下数值失败
 
-Status: proposed
+Status: implemented
 
 ## Problem
 
@@ -13,9 +13,21 @@ warnings），全部位于共享内存 online-softmax 归约：
 数值失败（num_splits=16 生产形状，max|diff|=0.083 vs 容差 0.002）。
 同一用例在正常执行与 memcheck 下通过（252/252 gate、42/42 memcheck）。
 
-## Proposal（待验证，非结论）
+## Decision
 
-先分离两种解释：
+根因已由 SASS 定位，为**真实竞态**（非 racecheck 误报）：
+
+- `/*1e10*/ LDS R0, [0x200]` 读共享内存 0x200 = `red[0]`
+  （scores 占 ATTEND_TILE=128 float = 0x200 字节）；
+- `/*2030*/ STS [R14+0x200], R3` 写 `red[wid]`（wid=0 即 red[0]）；
+- 两指令之间**没有 BAR.SYNC**（屏障在写之后 0x2040）。
+
+即 `block_reduce_max_dyn` 末尾的 `val = red[0]` 读与紧随其后的
+`block_reduce_sum_dyn` 开头的 `red[wid] = val` 写之间缺屏障：快 warp
+可在慢 warp 读取前覆写 red[0]。修复：两个归约函数在 `val = red[0]`
+之后各加一个 `__syncthreads()` 收尾屏障。
+
+原始分析路径（保留备查）：
 
 1. **真实竞态**：racecheck 串行化改变时序后暴露归约读写竞争。
    已核对 `block_reduce_max_dyn`/`block_reduce_sum_dyn` 的
@@ -40,13 +52,16 @@ warnings），全部位于共享内存 online-softmax 归约：
 - 若为误报，过度加固会增加 split 路径的同步开销，需要 A/B 验证
   TPOT 影响。
 
-## Acceptance criteria
+## Consequences
 
-- 明确 hazard 指向的共享变量与访问线程范围，给出"真实/误报"结论；
-- 若真实：修复后 racecheck 0 hazards 且 SplitKv oracle 在插桩下通过，
-  同时 gpu-gate 252/252 与 split-KV bitwise 一致性不回归；
-- 若误报：在 evidence README 记录判据（如 `--racecheck-report all`
-  无 hazard + 顺序固定后数值一致）。
+- racecheck 42/42 通过、**0 hazards**；memcheck 42/42、0 errors；
+  SplitKv oracle 在插桩下通过。
+- gpu-gate **252/252** 全过（此前 44 项失败是另一陷阱：旧 build 缓存
+  里 CMAKE_CUDA_ARCHITECTURES=52 静默生效，见同批 CMakeLists 加固）。
+- 性能影响：decode TPOT 2.2694ms vs 修复前 2.267ms（+0.1%，噪声内），
+  throughput 440.6 tok/s。
+- 生产意义：修复前该竞态在特定 warp 时序下可能产生错误 attention
+  输出；gate 通过不能证明安全，sanitizer 才是本结论的依据。
 
 ## Verification
 

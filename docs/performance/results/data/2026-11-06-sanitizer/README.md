@@ -39,7 +39,19 @@ online-softmax 归约路径：
   专门排查（复现命令：`compute-sanitizer --tool racecheck --print-limit 3
   ./build/tiny_llm_tests --gtest_filter='SplitKvTest.SplitMatchesIndependentOracle'`）。
 
-## 后续
+## 根因与修复（同日完成）
 
-见 `.agents/notes/proposed/bug-fix/2026-11-06-racecheck-splitkv-hazards.md`。
-修复前不应在面试材料中声称"sanitizer 全绿"。
+SASS 定位确认为**真实竞态**：读 `LDS R0, [0x200]`（red[0]）与写
+`STS [R14+0x200]`（red[wid]）之间无 BAR.SYNC——`block_reduce_max_dyn`
+末尾读取与下一次 `block_reduce_sum_dyn` 开头写入之间缺屏障。
+修复：两个归约函数在 `val = red[0]` 后各加收尾 `__syncthreads()`。
+
+修复后（`racecheck-after-fix.log` / `memcheck-after-fix.log`）：
+**racecheck 42/42、0 hazards；memcheck 42/42、0 errors**；
+gpu-gate 252/252；decode TPOT 2.2694ms（+0.1%，噪声内）。
+细节见 `.agents/notes/implemented/bug-fix/2026-11-06-racecheck-splitkv-hazards.md`。
+
+注：修复过程中的 44 项门禁失败是另一个陷阱——旧 build 缓存里
+`CMAKE_CUDA_ARCHITECTURES=52` 在增量 reconfigure 时静默生效（见
+`2026-11-05-cuda-arch-default-never-applies.md` 的后续节），与竞态
+修复无关。

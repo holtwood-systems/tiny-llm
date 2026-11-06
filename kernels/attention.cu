@@ -65,6 +65,9 @@ __device__ __forceinline__ float block_reduce_max_dyn(float val, float *red, int
     }
     __syncthreads();
     val = red[0];
+    // 收尾屏障：下一次归约（同 tile 内的 sum/max）会立刻覆写 red[0]，
+    // 缺此屏障时快 warp 可在慢 warp 读取前覆盖（racecheck + SASS 定位）。
+    __syncthreads();
     return val;
 }
 
@@ -82,6 +85,8 @@ __device__ __forceinline__ float block_reduce_sum_dyn(float val, float *red, int
     }
     __syncthreads();
     val = red[0];
+    // 同上：防止下一次归约覆写 red[0] 早于所有 warp 完成读取。
+    __syncthreads();
     return val;
 }
 

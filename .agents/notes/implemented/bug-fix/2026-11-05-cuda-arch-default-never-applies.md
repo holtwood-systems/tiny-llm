@@ -67,3 +67,16 @@ paged-kv、RoPE、w8a16 matmul、sampling）全挂，失败模式为输出全零
   `compute_XX` 只救得了驱动 ≥ 工具链的场景。
 - 本机另有进程常驻 ~42.7 GiB 显存（nvidia-smi 可见），大显存用例
   （如整模型 KV cache 分配）可能 OOM，属环境约束而非代码缺陷。
+
+## 后续（2026-11-06）：旧 build 缓存的二次陷阱
+
+首次修复（普通变量 shadow）只在**全新 configure** 生效。若 build 目录
+由修复前的版本创建（缓存里残留 check_language 预填的 52），增量
+reconfigure 时 `if(DEFINED CMAKE_CUDA_ARCHITECTURES)` 会把缓存值当成
+用户显式指定而跳过 native——实测静默退回 sm_52，SplitKv 等用例失败
+（max|diff|=1.25）。
+
+加固：缓存值等于 nvcc 遗留默认 52 时视为污染（打 WARNING 后覆盖），
+并用 `CACHE ... FORCE` 把 native 持久化，使增量与全新 configure
+行为一致。代价：用户显式 `-DCMAKE_CUDA_ARCHITECTURES=52` 也会被覆盖
+（52 在新工具链上本不可用，可接受）。

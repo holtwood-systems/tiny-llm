@@ -11,9 +11,15 @@ project(tiny-llm
 # check_language / enable_language 的编译器检测会把 CMAKE_CUDA_ARCHITECTURES
 # 填成 nvcc 默认（52），必须在此之前捕获用户的显式指定（-D / toolchain），见
 # .agents/notes/implemented/bug-fix/2026-11-05-cuda-arch-default-never-applies.md
-if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+# 缓存里若只剩 nvcc 遗留默认 52，视为 check_language 污染而非用户指定：
+# 无法从 cache 区分 "-D 显式 52" 与旧缓存残留，而 52 在新工具链上不可用
+# （PTX 版本被驱动拒绝），覆盖比静默退化安全。
+if(DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "52")
     set(_TLLM_USER_CUDA_ARCH TRUE)
 else()
+    if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+        message(WARNING "CMAKE_CUDA_ARCHITECTURES=52（nvcc 遗留默认/旧缓存）被忽略，改用 native")
+    endif()
     set(_TLLM_USER_CUDA_ARCH FALSE)
 endif()
 
@@ -49,10 +55,14 @@ FetchContent_MakeAvailable(spdlog)
 find_package(CUDAToolkit REQUIRED)
 
 if(NOT _TLLM_USER_CUDA_ARCH AND NOT DEFINED ENV{CUDAARCHS})
+    # 写入 cache 并 FORCE：普通变量只在本次 configure 生效，若 build 目录
+    # 由旧版本（含 check_language 预填 52 的缓存）增量 reconfigure，
+    # 缓存里的 52 会静默生效（2026-11-06 实测踩中）。FORCE 后 native
+    # 持久化，增量与全新 configure 行为一致。
     if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
-        set(CMAKE_CUDA_ARCHITECTURES native)
+        set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures" FORCE)
     else()
-        set(CMAKE_CUDA_ARCHITECTURES 70 75 80 86 89)
+        set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89" CACHE STRING "CUDA architectures" FORCE)
     endif()
 endif()
 
