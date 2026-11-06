@@ -96,7 +96,7 @@ enum class QuantizationType {
 > **状态**：量化精度评估尚未完成。本仓库目前没有真实模型的困惑度实测数据，
 > 不在此引用任何未经本仓库脚本复现的数字。
 
-评估计划（见 [ROADMAP](https://github.com/open-infra-ai/tiny-llm/blob/master/ROADMAP.md) 第 2 阶段）：
+评估计划（见 [ROADMAP](https://github.com/holtwood-systems/tiny-llm/blob/master/ROADMAP.md) 第 2 阶段）：
 
 1. 选定真实模型（Qwen2-0.5B / TinyLlama-1.1B）
 2. 对比 FP16 与 W8A16 路径在相同评估集上的困惑度

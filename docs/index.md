@@ -71,4 +71,4 @@ flowchart LR
 | [架构说明](/architecture/) | 运行时结构与职责划分 |
 | [API 参考](/api/) | 公共头文件与类型 |
 | [性能](/performance/) | 基准和优化说明 |
-| [GitHub 仓库](https://github.com/open-infra-ai/tiny-llm) | 源码、Issue、Release |
+| [GitHub 仓库](https://github.com/holtwood-systems/tiny-llm) | 源码、Issue、Release |

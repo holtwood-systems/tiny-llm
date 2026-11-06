@@ -48,11 +48,11 @@
 
 ## 2. Base evidence
 
-- **Repository**：`open-infra-ai/tiny-llm`
+- **Repository**：`holtwood-systems/tiny-llm`
 - **Base branch**：`master`
 - **Commit**：`2b15fb2b6e16671a91c648a5e1b3cf0666099b3f`（= backlog 审查参考 commit）
 - **Dirty state**：干净。本设计的直接前置 TLLM-P0-002 已开 PR
-  `open-infra-ai/tiny-llm#4`（分支 `tllm-p0-002-paged-oracle`，未合并）；
+  `holtwood-systems/tiny-llm#4`（分支 `tllm-p0-002-paged-oracle`，未合并）；
   TLLM-P0-004 的实现必须 rebase 到该 PR 合并后的 master。
 - **Existing code anchors**：
   | 位置 | 事实 |
@@ -281,7 +281,7 @@ ERROR SUMMARY: 13 errors
 prefill/decode、RoPE、FFI 缓冲尺寸），对合法模型零行为变化。
 **不在 kernel 层加**——`kernels/` 没有 `Result` 通道，在那里"校验"只能静默 return，
 比现状更糟；**也不只修 `forwardPaged`**——那样 prefill 分支与策略 2 仍然暴露。
-该修复已作为独立 PR 提交（`open-infra-ai/tiny-llm#6`），与本任务解耦。
+该修复已作为独立 PR 提交（`holtwood-systems/tiny-llm#6`），与本任务解耦。
 
 - **Fallback = 开关，不是"几何不支持"**：本设计**不引入**按几何自动回落的路径。
   理由是那条分支不可达也不可测：smem 需求为 `(ATTEN_TILE + 8 + head_dim) * 4 +
@@ -433,7 +433,7 @@ direct vs legacy 逐元素相等门禁**——任何漂移立即失败。该门�
 
 ### 10.2 后续：该取舍已按 issue #8 翻转（2026-09-14）
 
-**结论已改为「接受回归、改回共享循环」。** 见 `open-infra-ai/tiny-llm#8`。
+**结论已改为「接受回归、改回共享循环」。** 见 `holtwood-systems/tiny-llm#8`。
 
 翻转的理由与本节的原始记录并不矛盾——它质疑的是门禁**回退方案的收益**，而非测量本身：
 

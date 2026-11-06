@@ -79,7 +79,7 @@
 - [ ] 失败路径审计：加载损坏文件、显存不足、超长输入的行为与测试
 - [x] 导出 C ABI（`ffi.h`/`ffi.cpp`：`tinyllm_load` / `tinyllm_step` / `tinyllm_allocate_sequence`
       / `tinyllm_free_sequence` / `tinyllm_free`），供 paged-serving 调度层接入
-- [x] 与 [paged-serving](https://github.com/open-infra-ai/paged-serving) 的调度层对接：Rust `tiny-llm`
+- [x] 与 [paged-serving](https://github.com/holtwood-systems/paged-serving) 的调度层对接：Rust `tiny-llm`
       feature + build.rs 链接 + `TinyLlmExecutor`；分页 KV 策略 1 默认启用，3 并发 e2e
       与 llama.cpp greedy 对齐（2026-08-18，`phase-2-e`）
 - [x] C ABI 正常 greedy 的批量末端后处理：`logprobs_k == 0` 时每序列完成 layer forward

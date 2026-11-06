@@ -1,7 +1,7 @@
 # 性能基准
 
 > **状态**：基准测试体系**尚未建立**。本页面描述将要使用的方法，不包含任何实测数字。
-> 实测结果产出后（见 [ROADMAP](https://github.com/open-infra-ai/tiny-llm/blob/master/ROADMAP.md) 第 2 阶段），会以可复现脚本 + 数据快照的形式补充到这里。
+> 实测结果产出后（见 [ROADMAP](https://github.com/holtwood-systems/tiny-llm/blob/master/ROADMAP.md) 第 2 阶段），会以可复现脚本 + 数据快照的形式补充到这里。
 
 ## 计划采用的方法
 

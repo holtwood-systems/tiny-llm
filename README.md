@@ -1,21 +1,21 @@
 # Tiny-LLM 推理引擎
 
-> 📚 Portfolio map: https://github.com/open-infra-ai/open-infra-ai
+> 📚 Portfolio map: https://github.com/holtwood-systems/portfolio
 
 > 面向聚焦型 Transformer 工作负载的 CUDA 原生 C++ 推理引擎。
 
 > **项目状态**：**active**（学习/演进中）；权威状态注册表见
-> [open-infra-ai/open-infra-ai](https://github.com/open-infra-ai/open-infra-ai)。
+> [holtwood-systems/portfolio](https://github.com/holtwood-systems/portfolio)。
 
-[![CI](https://github.com/open-infra-ai/tiny-llm/actions/workflows/ci.yml/badge.svg)](https://github.com/open-infra-ai/tiny-llm/actions/workflows/ci.yml)
-[![Pages](https://github.com/open-infra-ai/tiny-llm/actions/workflows/pages.yml/badge.svg)](https://open-infra-ai.github.io/tiny-llm/)
-[![Release](https://img.shields.io/github/v/release/open-infra-ai/tiny-llm?include_prereleases&label=version)](https://github.com/open-infra-ai/tiny-llm/releases)
+[![CI](https://github.com/holtwood-systems/tiny-llm/actions/workflows/ci.yml/badge.svg)](https://github.com/holtwood-systems/tiny-llm/actions/workflows/ci.yml)
+[![Pages](https://github.com/holtwood-systems/tiny-llm/actions/workflows/pages.yml/badge.svg)](https://holtwood-systems.github.io/tiny-llm/)
+[![Release](https://img.shields.io/github/v/release/holtwood-systems/tiny-llm?include_prereleases&label=version)](https://github.com/holtwood-systems/tiny-llm/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![CUDA](https://img.shields.io/badge/CUDA-11.0+-76B900?logo=nvidia&logoColor=white)
 ![C++](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=c%2B%2B&logoColor=white)
 ![CMake](https://img.shields.io/badge/CMake-3.18+-064F8C?logo=cmake&logoColor=white)
 
-[文档](https://open-infra-ai.github.io/tiny-llm/) • [架构说明](https://open-infra-ai.github.io/tiny-llm/architecture/) • [API](https://open-infra-ai.github.io/tiny-llm/api/) • [路线图](ROADMAP.md) • [更新日志](CHANGELOG.md)
+[文档](https://holtwood-systems.github.io/tiny-llm/) • [架构说明](https://holtwood-systems.github.io/tiny-llm/architecture/) • [API](https://holtwood-systems.github.io/tiny-llm/api/) • [路线图](ROADMAP.md) • [更新日志](CHANGELOG.md)
 
 ---
 
@@ -23,7 +23,7 @@
 
 Tiny-LLM 将仓库表面保持得尽量小：CUDA/C++17 内核、W8A16 量化、显式 KV Cache 管理，以及一条更容易审计和维护的精简运行时路径。
 
-在 GPU 学习主线中，本仓库只负责模型权重到 token 生成的运行时主线；CUDA/Triton kernel 学习和 Serving 调度保持在各自主仓。整体顺序见 [`LEARNING_PATH.md`](https://github.com/open-infra-ai/open-infra-ai/blob/master/LEARNING_PATH.md)（meta 仓）。
+在 GPU 学习主线中，本仓库只负责模型权重到 token 生成的运行时主线；CUDA/Triton kernel 学习和 Serving 调度保持在各自主仓。整体顺序见 [`LEARNING_PATH.md`](https://github.com/holtwood-systems/portfolio/blob/master/LEARNING_PATH.md)（meta 仓）。
 
 ## 项目边界（IN / OUT）
 
@@ -34,9 +34,9 @@ Tiny-LLM 将仓库表面保持得尽量小：CUDA/C++17 内核、W8A16 量化、
 - 性能基准（TTFT / TPOT / tok/s / 常驻显存差值）与 CUDA Graphs 加速 decode
 
 **OUT（明确不做，见对应仓库）**：
-- 调度 / 批处理 / continuous batching → [paged-serving](https://github.com/open-infra-ai/paged-serving)
-- FlashAttention 深挖与优化 → [cuflash](https://github.com/open-infra-ai/cuflash)
-- Triton 算子 → [trifuse](https://github.com/open-infra-ai/trifuse)
+- 调度 / 批处理 / continuous batching → [paged-serving](https://github.com/holtwood-systems/paged-serving)
+- FlashAttention 深挖与优化 → [cuflash](https://github.com/holtwood-systems/cuflash)
+- Triton 算子 → [trifuse](https://github.com/holtwood-systems/trifuse)
 
 ## 项目状态（诚实声明）
 
@@ -120,7 +120,7 @@ Tiny-LLM 需要可用的 CUDA 工具链（`nvcc` 在 `PATH` 中，或已正确�
 | C++ 编译器 | GCC 9+ 或 Clang 10+ |
 
 ```bash
-git clone https://github.com/open-infra-ai/tiny-llm.git
+git clone https://github.com/holtwood-systems/tiny-llm.git
 cd tiny-llm
 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
@@ -193,7 +193,7 @@ CHANGELOG.md              唯一的已跟踪发布历史
 
 ## 参与贡献
 
-欢迎提交 Issue 与 Pull Request。请保持改动聚焦，让文档与真实运行时边界一致，并避免重新引入重复的流程脚手架。详见[开发者指南](https://open-infra-ai.github.io/tiny-llm/contributing/)。
+欢迎提交 Issue 与 Pull Request。请保持改动聚焦，让文档与真实运行时边界一致，并避免重新引入重复的流程脚手架。详见[开发者指南](https://holtwood-systems.github.io/tiny-llm/contributing/)。
 
 ## 许可证
 

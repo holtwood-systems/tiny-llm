@@ -251,6 +251,6 @@ std::cout << "intermediate_dim: " << config.intermediate_dim << std::endl;
 
 ### 资源
 
-- [GitHub Issues](https://github.com/open-infra-ai/tiny-llm/issues)
-- [文档](https://open-infra-ai.github.io/tiny-llm/)
+- [GitHub Issues](https://github.com/holtwood-systems/tiny-llm/issues)
+- [文档](https://holtwood-systems.github.io/tiny-llm/)
 - [API 参考](/api/inference-engine)

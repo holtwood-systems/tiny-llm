@@ -338,7 +338,7 @@ __global__ void rope_kernel(
 
 > 本页不引用实测性能数字。kernel 的数值正确性由 `tests/test_kernels.cu` 与
 > `tests/test_w8a16_matmul.cu` 的差分测试保证；吞吐与带宽数据需要在真实硬件上
-> 用基准脚本产出，计划见仓库根目录 [ROADMAP](https://github.com/open-infra-ai/tiny-llm/blob/master/ROADMAP.md)。
+> 用基准脚本产出，计划见仓库根目录 [ROADMAP](https://github.com/holtwood-systems/tiny-llm/blob/master/ROADMAP.md)。
 
 ---
 

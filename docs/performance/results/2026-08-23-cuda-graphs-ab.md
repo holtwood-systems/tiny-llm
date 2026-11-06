@@ -38,7 +38,7 @@ LD_LIBRARY_PATH=/usr/lib/wsl/lib \
   --max-tokens 64 --warmup 3 --iters 10 --json --no-graphs
 ```
 
-- [10 个进程的原始 JSONL](https://github.com/open-infra-ai/tiny-llm/blob/master/docs/performance/results/data/2026-08-23-cuda-graphs-ab.raw.jsonl)
+- [10 个进程的原始 JSONL](https://github.com/holtwood-systems/tiny-llm/blob/master/docs/performance/results/data/2026-08-23-cuda-graphs-ab.raw.jsonl)
 - [机器可读聚合与配对差值](data/2026-08-23-cuda-graphs-ab.summary.json)
 
 Graph on 五组均为 `enabled=true,captured=true`，off 五组均为

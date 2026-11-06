@@ -57,7 +57,7 @@
 
 ## 2. Base evidence
 
-- **Repository**：`open-infra-ai/tiny-llm`
+- **Repository**：`holtwood-systems/tiny-llm`
 - **Base branch**：`tllm-dpa-pr5-benchmark`（= PR #10 head，堆叠链 #4 → #7 → #9 → #10）
 - **Commit**：`7df9ec28d1b4dacceb68139965237302b05ada94`
 - **Dirty state**：干净（仅新增本设计文档的分支）

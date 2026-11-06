@@ -30,7 +30,7 @@ nvcc --version
 ### 2. 克隆仓库
 
 ```bash
-git clone https://github.com/open-infra-ai/tiny-llm.git
+git clone https://github.com/holtwood-systems/tiny-llm.git
 cd tiny-llm
 ```
 

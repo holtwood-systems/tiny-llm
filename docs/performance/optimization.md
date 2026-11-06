@@ -1,6 +1,6 @@
 # 优化
 
-本页区分**已实现的优化**与**计划中的优化**。计划项的落地顺序见 [ROADMAP](https://github.com/open-infra-ai/tiny-llm/blob/master/ROADMAP.md)。
+本页区分**已实现的优化**与**计划中的优化**。计划项的落地顺序见 [ROADMAP](https://github.com/holtwood-systems/tiny-llm/blob/master/ROADMAP.md)。
 
 ## 已实现的优化
 
@@ -52,7 +52,7 @@
 | FlashDecoding | 长上下文 decode attention | 待做；只复用算法经验，不把 cuflash 接入 generate 路径 |
 | fused kernel（rmsnorm/RoPE/QKV/bias） | 减少 kernel 数与中间显存 | 待做 |
 | KV Cache swapping/offload | 支持超出显存的并发序列 | 待做 |
-| 连续批处理 | 吞吐导向场景 | 待做（调度层设计见 [paged-serving](https://github.com/open-infra-ai/paged-serving)） |
+| 连续批处理 | 吞吐导向场景 | 待做（调度层设计见 [paged-serving](https://github.com/holtwood-systems/paged-serving)） |
 
 > 已完成项的开关和复现方式以代码与对应结果页为准；待做项在实现前不写虚构开关或
 > 预估加速比。

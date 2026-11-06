@@ -24,7 +24,7 @@ Tiny-LLM 是一个极简的教育性 LLM 推理引擎，使用 CUDA C++ 实现�
 
 ```bash
 # 克隆仓库
-git clone https://github.com/open-infra-ai/tiny-llm.git
+git clone https://github.com/holtwood-systems/tiny-llm.git
 cd tiny-llm
 
 # 配置并构建
