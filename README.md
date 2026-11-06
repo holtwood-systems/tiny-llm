@@ -19,6 +19,22 @@
 
 ---
 
+## 核心亮点
+
+- **真实权重端到端**：Qwen2.5-0.5B（GQA 14→2）与 SmolLM2-360M（GQA 15→5）两个真实 GGUF
+  模型从权重加载到生成 token 全链路验证；GPU 门禁 **252/252 通过、0 skip**。
+- **CUDA Graphs decode**：schema v2 五组配对 A/B，TPOT **-37.2%**（8.322→5.225 ms）、
+  decode 吞吐 **+59.3%**（120.168→191.384 tok/s，RTX 3060）；RTX 4090 基线
+  **2.267 ms/token / 441 tok/s**（graphs A/B 再降 10.4%）。
+- **compute-sanitizer 全绿**：racecheck 定位 block-reduce 缺收尾屏障的真实共享内存竞态
+  （SASS 证实），修复后 0 hazards、memcheck 42/42 0 errors，TPOT 影响 +0.1%（噪声内）。
+- **量化与组件全部可验证**：W8A16 kernel 差分测试；GGUF Q4_K/Q5_0/Q6_K 反量化与
+  Python `gguf` 参考一致；tokenizer 与 HuggingFace tokenizers 逐 id 差分对齐（30 例 417 token）。
+- **decode attention 三路对比**（legacy / contiguous / direct + split-KV）：30 个 shape 点
+  bitwise 等价，短序列 direct 最高 **1.84x**，交叉点 S≈512。
+
+---
+
 ## 项目概述
 
 Tiny-LLM 将仓库表面保持得尽量小：CUDA/C++17 内核、W8A16 量化、显式 KV Cache 管理，以及一条更容易审计和维护的精简运行时路径。
@@ -77,6 +93,22 @@ Tiny-LLM 将仓库表面保持得尽量小：CUDA/C++17 内核、W8A16 量化、
 > 2026-08-18 schema v1 与 kernel microbench 只保留为优化沿革，不和 schema v2 混算；
 > 见 [decode optimization](docs/performance/results/2026-08-18-decode-optimization.md)。
 
+### RTX 4090（sm_89）基线（2026-11-05，batch=1 decode 64 token）
+
+| 指标 | graphs on | graphs off | 变化 |
+|------|-----------|------------|------|
+| TPOT mean | 2.267 ms | 2.529 ms | **-10.4%** |
+| decode 吞吐 | 441.1 tok/s | 395.4 tok/s | — |
+| TTFT mean | 2.869 ms | 2.868 ms | — |
+
+> 与 3060 / 5070 Ti 数据**并列展示，不构成优化前后对比**。kernel 时间分布
+> （w8a16 matmul 占比 ≈46%、LM head 触及 ~966/1008 GB/s 带宽墙）与 decode
+> attention 三路对比见
+> [`2026-11-05-rtx4090.md`](docs/performance/results/2026-11-05-rtx4090.md)。
+> 2026-11-06 compute-sanitizer 首次全绿（racecheck 定位并修复真实竞态，
+> 证据与 SASS 判读保留）见
+> [`data/2026-11-06-sanitizer/README.md`](docs/performance/results/data/2026-11-06-sanitizer/README.md)。
+
 ## 已实现能力
 
 - **W8A16 推理路径**：INT8 权重 + FP16 激活
@@ -84,6 +116,23 @@ Tiny-LLM 将仓库表面保持得尽量小：CUDA/C++17 内核、W8A16 量化、
 - **CUDA 原生 Kernel**：共享内存与 warp 级优化模式
 - **基于 `Result<T>` 的可失败 API**：宿主侧错误传播更直接
 - **GoogleTest 测试覆盖**：kernel 数值差分、KV Cache 不变量、模型加载等核心路径
+
+## 面试考点映射
+
+每个核心组件都对应一类高频面试考点，证据全部在仓库内可复现：
+
+| 组件 / 决策 | 面试考点 | 仓库内证据 |
+|---|---|---|
+| W8A16（INT8 权重 × FP16 激活） | 权重量化 trade-off、为什么 W8A16/W4A16 是主流、反量化路径 | `kernels/w8a16_matmul.cu`、`tests/test_w8a16_matmul.cu` |
+| GGUF k-quant（Q4_K/Q5_0/Q6_K） | k-quant 与 Q4_0 的差别、超块 scale 布局、反量化正确性 | `src/gguf_parser.cpp`、`tests/test_quantization.cpp` |
+| GQA 14→2 / MQA 16→1 head 映射 | GQA 省 KV 显存的比例、MQA 极限、MHA 退化路径 | `tests/test_kernels.cu` + 两个真实模型门控 |
+| 分页 KV（block_tables + scatter/gather） | PagedAttention 原理、碎片消除、资源守恒不变量 | `kernels/paged_kv.cu`、`tests/test_kv_cache.cpp` |
+| decode attention 三路 + split-KV | flash-decoding 思想、split 切分与归约、交叉点形状 | `docs/architecture/decode-attention-splitkv-design.md`、dpa bench |
+| CUDA Graphs decode | decode 为什么吃 launch 开销、graph capture 的形状约束 | `docs/performance/cuda-graphs.md`、schema v2 A/B |
+| block-reduce 竞态修复 | `__syncthreads` 语义、warp-synchronous 陷阱、sanitizer 方法论 | `docs/performance/results/data/2026-11-06-sanitizer/README.md` |
+| LM head 带宽墙（~966 / 1008 GB/s） | decode 是 bandwidth-bound、roofline 手算与验证 | `docs/performance/results/2026-11-05-rtx4090.md` |
+| 手写 BPE tokenizer | gpt2 字节级编码、预分词正则、与 HF 差分方法 | `src/tokenizer.cpp`、`tests/test_tokenizer.cpp` |
+| C ABI（`ffi.h`） | 数据面/控制面边界、跨语言 FFI、ABI 稳定性策略 | `include/tiny_llm/ffi.h` ⇄ paged-serving |
 
 ## 模型加载
 
