@@ -1,4 +1,6 @@
-# 跨节点复现 + 7B 扩展性证据（2026-11-06）
+# Agent Note: 跨节点复现与 7B 扩展性证据（2026-11-06）
+
+Status: implemented
 
 ## Problem
 
@@ -14,6 +16,18 @@
 3. 镜像 compat 驱动库导致的 CUDA 804 作为环境坑证据保留
    （修复前后双 gate 日志）。
 
+## Alternatives considered
+
+- **只保留 0.5B 单节点证据，暂不跑 7B**：成本最低，但会让“更大模型/
+  不同 GQA 几何”的路径继续未验证；7B 是当时唯一可用的扩展性样本，否决。
+- **等待稳定的 4090 节点再做 7B**：能避免临时节点的回收风险，但 Node B
+  当时可用且租期有限；错过这次就要重新排队，否决。
+- **只在同 toolkit 版本节点复现**：能减少变量，但无法回答“换 CUDA
+  12.8.93/镜像 compat 驱动后是否仍能跑”的问题；保留 804 失败日志更有
+  工程价值，否决。
+- **用 synthetic 7B 权重或跳过真实 GGUF**：能快速测 kernel，但不会
+  覆盖真实 GGUF 解析、GQA 几何和权重上传路径，否决。
+
 ## Consequences
 
 - Node B gate 252/252（修复后，72.84s）；decode TPOT 2.281ms vs
@@ -24,7 +38,9 @@
   绕回真驱动即可。文档见
   `docs/performance/results/data/2026-11-06-nodeb-rtx4090-cuda128.93/README.md`。
 - 7B 实测：TPOT 11.26ms / 88.8 tok/s / RSS +23GB；GGUF 解析与
-  W8A16+Graphs 路径在 7B/GQA 下无需改动。
+  W8A16+Graphs 路径在 7B/GQA 下无需改动。该 bench 是 7B 性能的独立
+  参照；paged-serving 的 7B serving canary 已因 provenance 缺失被标记
+  invalid，不能与本 bench 混算。
 - 限制：Node B 为租用临时节点（可能已回收），复现命令已写入
   证据 README；7B 跑时有外部租户占 3.5GiB 显存。
 
