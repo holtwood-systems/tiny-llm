@@ -1,0 +1,6 @@
+/usr/local/cuda-12.8/compat
+Driver Version                            : 550.107.02
+CUDA Version                              : 12.8
+               total        used        free      shared  buff/cache   available
+Mem:            1007         170          82           0         754         830
+/dev/nvme0n1    500G  901M  500G   1% /data
