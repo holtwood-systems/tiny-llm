@@ -470,7 +470,8 @@ TEST_F(GGUFHeaderTest, ValidHeaderTruncatedTensorData) {
     auto data_result = parser.readTensorData(parser.getTensors()[0]);
     EXPECT_TRUE(data_result.isErr()) << "truncated tensor data must fail cleanly";
     EXPECT_TRUE(data_result.error().find("Failed to read tensor") != std::string::npos ||
-                data_result.error().find("seek") != std::string::npos)
+                data_result.error().find("seek") != std::string::npos ||
+                data_result.error().find("exceeds remaining file bytes") != std::string::npos)
         << "unexpected error message: " << data_result.error();
 }
 
