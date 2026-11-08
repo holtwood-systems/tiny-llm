@@ -42,6 +42,39 @@ All notable tracked releases of Tiny-LLM are recorded here.
 
 ### Fixed
 
+- 2026-11-08：C ABI 不再静默忽略 `positions` 与 `TinyLlmConfig` 的 6 个几何
+  字段。`positions` 改为必填并校验：prefill 段必须是 `0..len-1` 的连续绝对
+  位置，decode 段必须等于后端内部位置计数（调用方 `context_len - 1`），
+  decode 的 `seq_len` 必须为 1；不一致返回错误而不是把 token 写到错误的
+  RoPE 位置。几何字段传 0 表示由 GGUF 提取，非 0 时必须与 GGUF 一致，
+  否则 `tinyllm_load` 返回 NULL 并指出不匹配字段。新增
+  `TinyLlmLoadRejectsMismatchedGeometry` 与
+  `TinyLlmStepRejectsMismatchedPositions` 回归。
+- 2026-11-08：`tinyllm_load` 在任一中间步骤失败时泄漏已分配的 GPU 资源。
+  释放逻辑收敛到 `TinyLlmHandleImpl` 析构（权重、RoPE / 激活 / logits /
+  分页 KV 缓冲、stream），失败路径上的 `unique_ptr` 在离开作用域时自动回收；
+  `tinyllm_free` 简化为 `delete`，与失败路径共用同一套清理。
+- 2026-11-08：`GGUFParser::validateTensorShapes` 在 GPU 分配前把已知张量的
+  dimensions 与 `ModelConfig` 交叉校验（GGUF 反序维度：`dimensions[0]` =
+  in_features）。维度写反（如 `ffn_down` 的 `[in,out]` 颠倒）元素总数不变，
+  旧实现会按错误布局静默加载；词表维与 `config.vocab_size` 不一致还会让
+  `lm_head_fp16_t` 的转置按错误步长读行。`ModelLoader::loadGGUF` 在缺失检查
+  之后调用，错误一次性列出全部不匹配的张量。
+- 2026-11-08：旧 CMake（<3.24）的 CUDA 回退架构列表改为按工具链版本生成：
+  `70;75;80` 恒有，CUDA ≥11.1 追加 `86`、≥11.8 追加 `89`。原先固定写
+  `86;89` 会让 README 声称支持的 CUDA 11.0–11.7 + CMake 3.18–3.23 在 build
+  阶段报 "Unsupported gpu architecture"。
+- 2026-11-08：`GGUFParser::readTensorData` 在分配前校验声明的张量尺寸不超过
+  文件剩余字节。旧路径先按伪造 dimensions 分配（可被构造 GGUF 触发数 GB 分配
+  与 OOM-kill）再读文件；新增
+  `GGUFParser.RejectsTensorDataExceedingFileRemainder` 回归。
+- 2026-11-08：`dequantizeQ4_0` 的 4-bit 展开顺序改为 GGML/GGUF 的
+  split-half 布局（低 nibble = 值 `j`，高 nibble = 值 `j+16`），与同文件
+  `dequantizeQ5_0` 一致。旧实现按 `2j`/`2j+1` 交错展开，导致 Q4_0 GGUF 的
+  每个 32 值块被静默重排、模型输出错误而不报错。新增
+  `DequantizeQ4_0.MatchesGGMLSplitHalfLayout` 合成块测试；README 与
+  `docs/performance/index.md` 同步把「真实模型验证」限定到 Q4_K_M 实际覆盖的
+  Q5_0/Q4_K/Q6_K。
 - `LayerWorkspace::allocate` 补齐 `attn_partial` 的分配（`num_heads *
   kAttnMaxSplits * (2 + head_dim)` fp32，布局见 `transformer.h`）。此前 PR-C
   接线时留下了 "EXPERIMENT: allocation disabled" 标记，生产路径上该指针恒为

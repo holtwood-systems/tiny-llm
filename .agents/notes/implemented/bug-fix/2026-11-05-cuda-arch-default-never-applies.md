@@ -36,7 +36,8 @@ paged-kv、RoPE、w8a16 matmul、sampling）全挂，失败模式为输出全零
 `_TLLM_USER_CUDA_ARCH`（命令行 `-D` 与 toolchain 文件在此可见；
 `check_language` 自身就会先把变量填成 52，放它后面同样失效——已实测）；
 `enable_language` 之后按该哨兵判断：用户未传且未设 `CUDAARCHS`
-环境变量时，`native`（cmake ≥3.24）或 `70;75;80;86;89`（旧 cmake）。
+环境变量时，`native`（cmake ≥3.24）或按工具链版本生成的回退列表
+（旧 cmake：`70;75;80`，CUDA ≥11.1 追加 `86`，CUDA ≥11.8 追加 `89`）。
 
 显式 `-DCMAKE_CUDA_ARCHITECTURES=` 与环境变量 `CUDAARCHS` 均视为用户
 指定，不再覆盖。
@@ -80,3 +81,12 @@ reconfigure 时 `if(DEFINED CMAKE_CUDA_ARCHITECTURES)` 会把缓存值当成
 并用 `CACHE ... FORCE` 把 native 持久化，使增量与全新 configure
 行为一致。代价：用户显式 `-DCMAKE_CUDA_ARCHITECTURES=52` 也会被覆盖
 （52 在新工具链上本不可用，可接受）。
+
+## 后续（2026-11-08）：旧 CMake 回退列表与 CUDA 最低版本冲突
+
+固定的 `70;75;80;86;89` 与 README 的 CUDA 11.0+ 声明冲突：sm_86 需
+CUDA 11.1+，sm_89 需 11.8+；在 CMake 3.18–3.23 + CUDA 11.0–11.7 下
+configure 成功、build 阶段才报 "Unsupported gpu architecture"。回退
+列表改为按 `CUDAToolkit_VERSION` 生成：`70;75;80` 恒有，≥11.1 追加
+`86`，≥11.8 追加 `89`。CMake ≥3.24 仍走 `native`，不受影响。本机无
+nvcc，未实际编译验证。

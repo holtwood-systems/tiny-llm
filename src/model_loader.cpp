@@ -150,7 +150,15 @@ Result<ModelWeights> ModelLoader::loadGGUF(const std::string &path, ModelConfig 
         return Result<ModelWeights>::err("GGUF runtime tensors missing: " + missing);
     }
 
-    // 所有必要 tensor 已验证存在，开始读取、转换并上传 GPU
+    // 形状与配置交叉校验：维度写反（如 ffn_down 的 [in,out] 颠倒）的元素总数
+    // 往往仍然“合法”，但会按错误布局加载并产出错误数值。必须在分配 GPU
+    // 内存前拒绝。
+    if (auto shape_check = parser.validateTensorShapes(config); shape_check.isErr()) {
+        TLLM_ERROR("GGUF tensor shape validation failed: {}", shape_check.error());
+        return Result<ModelWeights>::err(shape_check.error());
+    }
+
+    // 所有必要 tensor 已验证存在且形状匹配，开始读取、转换并上传 GPU
     ModelWeights weights;
     bool         success = false;
     auto         cleanup_on_error = [&]() {

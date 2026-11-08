@@ -41,19 +41,13 @@ Result<std::vector<half>> dequantizeQ4_0(const uint8_t *data, size_t num_blocks)
         float scale_f = __half2float(*scale);
 
         for (size_t i = 0; i < BLOCK_SIZE; ++i) {
-            // Each byte contains two 4-bit values
-            uint8_t packed_byte = packed[i / 2];
-            int8_t  value;
-            if (i % 2 == 0) {
-                // Lower 4 bits
-                value = (packed_byte & 0x0F);
-                // Convert from unsigned 4-bit to signed: 0-15 -> -8 to 7
-                value = (value > 7) ? (value - 16) : value;
-            } else {
-                // Upper 4 bits
-                value = (packed_byte >> 4);
-                value = (value > 7) ? (value - 16) : value;
-            }
+            // GGML packs value i in the low nibble of qs[i] for i < 16, and
+            // value i+16 in the high nibble of qs[i]. This is the same layout
+            // as Q5_0's low 4 bits, not an interleaved low/high stream.
+            const uint8_t packed_byte = packed[i < 16 ? i : i - 16];
+            const uint8_t nibble = (i < 16) ? (packed_byte & 0x0F) : (packed_byte >> 4);
+            // Convert from unsigned 4-bit to signed: 0-15 -> -8 to 7
+            const int8_t value = static_cast<int8_t>(nibble > 7 ? nibble - 16 : nibble);
 
             float dequantized = scale_f * static_cast<float>(value);
             result[b * BLOCK_SIZE + i] = __float2half(dequantized);

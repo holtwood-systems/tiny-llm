@@ -184,6 +184,22 @@ class GGUFParser {
     Result<ModelConfig> extractModelConfig() const;
 
     /**
+     * @brief Validate tensor dimensions against the model configuration
+     *
+     * GGUF 的 ne[] 是反序维度：dimensions[0] 是最内层（in_features），
+     * dimensions[1] 是 out_features。校验必须在分配 GPU 内存前完成，
+     * 否则维度写反或截断的文件会按错误布局静默加载。
+     *
+     * 只校验文件中存在的已知张量；缺失张量由 ModelLoader 统一报告。
+     * 词表维要求与 config.vocab_size 精确相等：lm_head 的 FP16 转置副本
+     * 按 config.vocab_size 定步长，padding 会导致转置读错行。
+     *
+     * @param config 由同一文件 extractModelConfig() 得到的配置
+     * @return Result indicating success or a list of mismatches
+     */
+    Result<void> validateTensorShapes(const ModelConfig &config) const;
+
+    /**
      * @brief Get tensor by name
      * @param name Tensor name
      * @return Pointer to tensor info or nullptr if not found

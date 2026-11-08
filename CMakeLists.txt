@@ -62,7 +62,17 @@ if(NOT _TLLM_USER_CUDA_ARCH AND NOT DEFINED ENV{CUDAARCHS})
     if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
         set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures" FORCE)
     else()
-        set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89" CACHE STRING "CUDA architectures" FORCE)
+        # 旧 CMake 没有 native，按工具链版本选择：sm_86 需 CUDA 11.1+，
+        # sm_89 需 11.8+。固定写 86/89 会让 README 声称支持的 CUDA 11.0
+        # 在 build 阶段以 "Unsupported gpu architecture" 失败。
+        set(_tllm_fallback_archs 70 75 80)
+        if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.1")
+            list(APPEND _tllm_fallback_archs 86)
+        endif()
+        if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8")
+            list(APPEND _tllm_fallback_archs 89)
+        endif()
+        set(CMAKE_CUDA_ARCHITECTURES "${_tllm_fallback_archs}" CACHE STRING "CUDA architectures" FORCE)
     endif()
 endif()
 

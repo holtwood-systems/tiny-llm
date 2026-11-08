@@ -69,6 +69,24 @@ struct TinyLlmHandleImpl {
     half *paged_k_scratch = nullptr; // [max_visible_tokens * kv_dim]
     half *paged_v_scratch = nullptr;
     tiny_llm::DeviceBuffer<int> d_block_tables; // 容量 max_num_blocks
+
+    // 资源释放放在析构里：tinyllm_load 在任一中间步骤失败（GGUF 解析、权重
+    // 加载、分页参数校验、KV cache 创建、cudaMalloc 异常）都会直接返回
+    // nullptr，裸指针与 ModelWeights 没有其他所有者，旧实现会把已分配的
+    // GPU 内存永久泄漏。unique_ptr<TinyLlmHandleImpl> 在失败路径离开作用域
+    // 时由本析构统一回收。
+    ~TinyLlmHandleImpl() {
+        if (rope_cos) cudaFree(rope_cos);
+        if (rope_sin) cudaFree(rope_sin);
+        if (hidden_buf) cudaFree(hidden_buf);
+        if (logits_buf) cudaFree(logits_buf);
+        if (paged_k_pool) cudaFree(paged_k_pool);
+        if (paged_v_pool) cudaFree(paged_v_pool);
+        if (paged_k_scratch) cudaFree(paged_k_scratch);
+        if (paged_v_scratch) cudaFree(paged_v_scratch);
+        if (stream) cudaStreamDestroy(stream);
+        tiny_llm::ModelLoader::freeWeights(weights);
+    }
 };
 
 // ── 内部工具 ─────────────────────────────────────────────
@@ -194,6 +212,34 @@ TinyLlmHandle *tinyllm_load(const char *model_path, const TinyLlmConfig *config,
             return nullptr;
         }
         h->config = cfg_result.value();
+
+        // C ABI 兼容契约：6 个几何字段允许传 0（表示“由 GGUF 提取”），
+        // 非 0 时必须与 GGUF 一致。旧实现完全忽略这些字段，调用方以为
+        // 自己指定了模型几何、实际却按文件里的另一套配置运行。
+        if (config != nullptr) {
+            struct DimField {
+                const char *name;
+                int         passed;
+                int         actual;
+            };
+            const DimField dim_fields[] = {
+                {"hidden_dim", config->hidden_dim, h->config.hidden_dim},
+                {"num_layers", config->num_layers, h->config.num_layers},
+                {"num_heads", config->num_heads, h->config.num_heads},
+                {"num_kv_heads", config->num_kv_heads, h->config.num_kv_heads},
+                {"head_dim", config->head_dim, h->config.head_dim},
+                {"vocab_size", config->vocab_size, h->config.vocab_size},
+            };
+            for (const auto &f : dim_fields) {
+                if (f.passed != 0 && f.passed != f.actual) {
+                    set_err(err_buf, err_buf_len,
+                            std::string("tinyllm_load: config.") + f.name + "=" +
+                                std::to_string(f.passed) + " does not match GGUF value " +
+                                std::to_string(f.actual));
+                    return nullptr;
+                }
+            }
+        }
 
         // 修复：C ABI 此前不校验模型几何，而 attention kernel 中
         // kv_head(q_head) = q_head / (num_heads / num_kv_heads) 是整数除法。
@@ -366,8 +412,9 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
                  const int *positions, const int *seq_lens, const int *block_tables,
                  const int *num_blocks, const unsigned char *is_prefill, int num_sequences,
                  int *next_tokens, float *logprobs, int logprobs_k) {
-    if (handle == nullptr || seq_ids == nullptr || input_tokens == nullptr || seq_lens == nullptr ||
-        is_prefill == nullptr || next_tokens == nullptr || num_sequences <= 0) {
+    if (handle == nullptr || seq_ids == nullptr || input_tokens == nullptr ||
+        positions == nullptr || seq_lens == nullptr || is_prefill == nullptr ||
+        next_tokens == nullptr || num_sequences <= 0) {
         return TLLM_ERR;
     }
     auto     *h = reinterpret_cast<TinyLlmHandleImpl *>(handle);
@@ -408,7 +455,18 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
         auto &st = it->second;
 
         const int *toks = input_tokens + offset;
+        const int *poses = positions + offset;
         offset += len;
+
+        // positions 不再静默忽略：prefill 必须是从 0 开始的连续绝对位置，
+        // decode 必须等于后端内部位置计数（即调用方的 context_len - 1）。
+        // 不一致说明调用方与后端对上下文长度的记账已经分叉，继续执行会把
+        // token 写到错误的 RoPE 位置 / KV 槽位而不报错。
+        if (!is_prefill[s] && len != 1) return TLLM_ERR;
+        for (int i = 0; i < len; ++i) {
+            const int expected = is_prefill[s] ? i : st.position;
+            if (poses[i] != expected) return TLLM_ERR;
+        }
 
         try {
             if (std::getenv("TLLM_FFI_DEBUG") && !h->paged_kv) {
@@ -626,47 +684,9 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
 
 void tinyllm_free(TinyLlmHandle *handle) {
     if (handle == nullptr) return;
-    auto *h = reinterpret_cast<TinyLlmHandleImpl *>(handle);
-    // LayerWorkspace 与各组件 RAII 释放；显式释放裸指针
-    if (h->rope_cos) {
-        cudaFree(h->rope_cos);
-        h->rope_cos = nullptr;
-    }
-    if (h->rope_sin) {
-        cudaFree(h->rope_sin);
-        h->rope_sin = nullptr;
-    }
-    if (h->hidden_buf) {
-        cudaFree(h->hidden_buf);
-        h->hidden_buf = nullptr;
-    }
-    if (h->logits_buf) {
-        cudaFree(h->logits_buf);
-        h->logits_buf = nullptr;
-    }
-    // 分页 KV pool / scratch（裸指针，显式释放；d_block_tables 是 RAII）
-    if (h->paged_k_pool) {
-        cudaFree(h->paged_k_pool);
-        h->paged_k_pool = nullptr;
-    }
-    if (h->paged_v_pool) {
-        cudaFree(h->paged_v_pool);
-        h->paged_v_pool = nullptr;
-    }
-    if (h->paged_k_scratch) {
-        cudaFree(h->paged_k_scratch);
-        h->paged_k_scratch = nullptr;
-    }
-    if (h->paged_v_scratch) {
-        cudaFree(h->paged_v_scratch);
-        h->paged_v_scratch = nullptr;
-    }
-    if (h->stream) {
-        cudaStreamDestroy(h->stream);
-        h->stream = 0;
-    }
-    tiny_llm::ModelLoader::freeWeights(h->weights);
-    delete h;
+    // 全部释放逻辑在 TinyLlmHandleImpl::~TinyLlmHandleImpl()，
+    // 与 tinyllm_load 的失败路径共用同一套清理。
+    delete reinterpret_cast<TinyLlmHandleImpl *>(handle);
 }
 
 } // extern "C"

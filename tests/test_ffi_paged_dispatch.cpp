@@ -299,10 +299,11 @@ HandlePtr loadPaged(const char *path) {
 }
 
 // 单次 decode 步（策略 1，可选 logprobs）。
-int decodeStep(TinyLlmHandle *h, int tok, int nb, int *next, float *lp, int lp_k) {
+// positions 不再被后端忽略：decode 必须传绝对位置（= context_len - 1，
+// 与后端 st.position 一致），否则 tinyllm_step 显式失败。
+int decodeStep(TinyLlmHandle *h, int tok, int nb, int pos, int *next, float *lp, int lp_k) {
     int           seq_ids[] = {0}, len1[] = {1};
     unsigned char dec[] = {0};
-    int           pos = -1; // paged 路径内部用 st.position，positions 参数被忽略
     return tinyllm_step(h, seq_ids, &tok, &pos, len1, kBlocks.data(), &nb, dec, 1, next, lp, lp_k);
 }
 
@@ -352,7 +353,7 @@ SeqOut runPagedSeq(TinyLlmHandle *h, int lp_k) {
     // 块表随可见窗口增长：visible = 48+i+1，第 17 步起需要第 5 块
     for (int i = 0; i < kDecodeSteps; ++i) {
         const int need = (kPromptLen + i + 1 + kBlockSize - 1) / kBlockSize;
-        rc = decodeStep(h, kFeedToken, need, &next, lp.data(), lp_k);
+        rc = decodeStep(h, kFeedToken, need, kPromptLen + i, &next, lp.data(), lp_k);
         out.steps_rc.push_back(rc);
         if (rc != 0 || next < 0) break;
         out.tokens.push_back(next);
@@ -550,13 +551,64 @@ TEST_F(FfiPagedDispatchTest, InvalidSplitKvEnvFailsCleanly) {
     splitkv.set("garbage");
     nb = 4;
     int bad_next = -1;
-    EXPECT_NE(decodeStep(h.get(), kFeedToken, nb, &bad_next, nullptr, 0), 0)
+    EXPECT_NE(decodeStep(h.get(), kFeedToken, nb, kPromptLen, &bad_next, nullptr, 0), 0)
         << "invalid TLLM_ATTN_SPLITKV must fail at decode dispatch";
 
     splitkv.unset();
     nb = 4;
     int good_next = -1;
-    EXPECT_EQ(decodeStep(h.get(), kFeedToken, nb, &good_next, nullptr, 0), 0)
+    EXPECT_EQ(decodeStep(h.get(), kFeedToken, nb, kPromptLen, &good_next, nullptr, 0), 0)
         << "handle must stay usable after env restored";
+    EXPECT_EQ(tinyllm_free_sequence(h.get(), 0), 0);
+}
+
+// C ABI 契约：几何字段非 0 时必须与 GGUF 一致，否则 load 显式失败，
+// 而不是让调用方以为自己的配置生效、实际按另一套几何运行。
+TEST_F(FfiPagedDispatchTest, TinyLlmLoadRejectsMismatchedGeometry) {
+    char          err[512] = {0};
+    TinyLlmConfig cfg = {kHidden + 1, 0, 0, 0, 0, 0, kBlockSize, 1, kMaxBlocks};
+    EXPECT_EQ(tinyllm_load(model_path_.c_str(), &cfg, err, sizeof(err)), nullptr);
+    EXPECT_NE(std::string(err).find("hidden_dim"), std::string::npos) << err;
+}
+
+// positions 不再被静默忽略：prefill 必须是 0..len-1，decode 必须等于后端
+// 内部位置计数，decode 的 seq_len 必须为 1。校验在任何 kernel 之前返回。
+TEST_F(FfiPagedDispatchTest, TinyLlmStepRejectsMismatchedPositions) {
+    auto h = loadPaged(model_path_.c_str());
+    ASSERT_NE(h, nullptr);
+    ASSERT_EQ(tinyllm_allocate_sequence(h.get(), 0, kPromptLen + 8), 0);
+
+    const auto       prompt = promptTokens();
+    auto             pos = promptPositions();
+    int              seq_ids[] = {0}, seq_lens[] = {kPromptLen}, nb = 3, next = -1;
+    unsigned char    pre[] = {1};
+    std::vector<int> blocks = kBlocks;
+
+    // prefill 位置不是从 0 开始
+    pos[0] = 1;
+    EXPECT_NE(tinyllm_step(h.get(), seq_ids, prompt.data(), pos.data(), seq_lens, blocks.data(),
+                           &nb, pre, 1, &next, nullptr, 0),
+              0);
+
+    // 恢复合法 prefill，再验证 decode 位置与 seq_len
+    pos = promptPositions();
+    ASSERT_EQ(tinyllm_step(h.get(), seq_ids, prompt.data(), pos.data(), seq_lens, blocks.data(),
+                           &nb, pre, 1, &next, nullptr, 0),
+              0);
+    int           tok = kFeedToken;
+    int           len1[] = {1}, need = 3;
+    unsigned char dec[] = {0};
+
+    int wrong_pos = kPromptLen + 1;
+    EXPECT_NE(tinyllm_step(h.get(), seq_ids, &tok, &wrong_pos, len1, blocks.data(), &need, dec, 1,
+                           &next, nullptr, 0),
+              0);
+
+    int good_pos = kPromptLen;
+    int len2[] = {2};
+    EXPECT_NE(tinyllm_step(h.get(), seq_ids, &tok, &good_pos, len2, blocks.data(), &need, dec, 1,
+                           &next, nullptr, 0),
+              0);
+
     EXPECT_EQ(tinyllm_free_sequence(h.get(), 0), 0);
 }

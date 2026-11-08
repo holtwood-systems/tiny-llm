@@ -66,6 +66,29 @@ std::vector<uint8_t> headerWithTensors(uint32_t version, uint64_t n_tensors) {
     return b;
 }
 
+// 追加一条 tensor info（不写数据区；形状校验只读 info，不读数据）
+void pushTensorInfo(std::vector<uint8_t> &b, const std::string &name,
+                    std::initializer_list<uint64_t> dims) {
+    pushStr(b, name);
+    pushU32(b, static_cast<uint32_t>(dims.size()));
+    for (uint64_t d : dims)
+        pushU64(b, d);
+    pushU32(b, 0); // type = F32
+    pushU64(b, 0); // offset
+}
+
+ModelConfig smallConfig() {
+    ModelConfig cfg;
+    cfg.hidden_dim = 8;
+    cfg.num_layers = 1;
+    cfg.num_heads = 2;
+    cfg.head_dim = 4;
+    cfg.num_kv_heads = 1;
+    cfg.vocab_size = 32;
+    cfg.intermediate_dim = 16;
+    return cfg;
+}
+
 } // namespace
 
 // R4: GGUF v1 必须被拒绝（version < 2 不再仅 WARN）
@@ -170,6 +193,107 @@ TEST(GGUFParser, RejectsTensorOffsetOverflow) {
     ASSERT_EQ(p.getTensors().size(), 1u);
     EXPECT_TRUE(p.readTensorData(p.getTensors()[0]).isErr())
         << "offset 加法回绕必须被拒绝，而不是 seek 到错误偏移";
+
+    std::remove(path.c_str());
+}
+
+// 健壮性：tensor 声明的尺寸超过文件剩余字节时，必须在分配前拒绝。
+// 否则一个几百字节的伪造 GGUF 可声明巨大 dimensions，先分配数 GB 再读失败，
+// 在 Linux 上表现为 OOM-kill 而不是解析错误。
+TEST(GGUFParser, RejectsTensorDataExceedingFileRemainder) {
+    auto buf = headerWithTensors(3, 1);
+    pushStr(buf, "t0");
+    pushU32(buf, 1);    // n_dims = 1
+    pushU64(buf, 1024); // 1024 个 F32 = 4096 字节，但文件在 tensor info 后结束
+    pushU32(buf, 0);    // type = F32
+    pushU64(buf, 0);    // offset = 0
+
+    const std::string path = tmpPath("truncated");
+    writeFile(path, buf);
+
+    GGUFParser p(path);
+    ASSERT_TRUE(p.parse().isOk()) << "tensor info 本身结构合法，parse 应通过";
+    ASSERT_EQ(p.getTensors().size(), 1u);
+    auto r = p.readTensorData(p.getTensors()[0]);
+    ASSERT_TRUE(r.isErr()) << "声明尺寸大于文件剩余字节必须在分配前拒绝";
+    EXPECT_NE(r.error().find("remaining"), std::string::npos) << r.error();
+
+    std::remove(path.c_str());
+}
+
+// 形状与 ModelConfig 交叉校验：合法维度（含 blk./layers. 两种前缀）必须通过。
+TEST(GGUFParser, ValidatesTensorShapesAgainstConfig) {
+    auto buf = headerWithTensors(3, 8);
+    pushTensorInfo(buf, "token_embd.weight", {8, 32});
+    pushTensorInfo(buf, "blk.0.attn_q.weight", {8, 8});
+    pushTensorInfo(buf, "blk.0.attn_k.weight", {8, 4});
+    pushTensorInfo(buf, "blk.0.ffn_down.weight", {16, 8});
+    pushTensorInfo(buf, "blk.0.attn_norm.weight", {8});
+    pushTensorInfo(buf, "output.weight", {8, 32});
+    pushTensorInfo(buf, "blk.0.attn_q.bias", {8});
+    pushTensorInfo(buf, "layers.0.attn_v.bias", {4});
+
+    const std::string path = tmpPath("shape_ok");
+    writeFile(path, buf);
+
+    GGUFParser p(path);
+    ASSERT_TRUE(p.parse().isOk());
+    auto r = p.validateTensorShapes(smallConfig());
+    EXPECT_TRUE(r.isOk()) << (r.isErr() ? r.error() : "");
+
+    std::remove(path.c_str());
+}
+
+// 维度写反（ffn_down 的 in/out 颠倒）元素总数不变，但布局错误，必须拒绝。
+TEST(GGUFParser, RejectsTransposedTensorShape) {
+    auto buf = headerWithTensors(3, 1);
+    pushTensorInfo(buf, "blk.0.ffn_down.weight", {8, 16});
+
+    const std::string path = tmpPath("shape_transposed");
+    writeFile(path, buf);
+
+    GGUFParser p(path);
+    ASSERT_TRUE(p.parse().isOk());
+    auto r = p.validateTensorShapes(smallConfig());
+    ASSERT_TRUE(r.isErr()) << "shape [8,16] 与 ffn_down 期望 [16,8] 不符，必须拒绝";
+    EXPECT_NE(r.error().find("blk.0.ffn_down.weight"), std::string::npos) << r.error();
+    EXPECT_NE(r.error().find("[8, 16]"), std::string::npos) << r.error();
+    EXPECT_NE(r.error().find("[16, 8]"), std::string::npos) << r.error();
+
+    std::remove(path.c_str());
+}
+
+// 词表维必须与 config.vocab_size 精确相等：lm_head 的 FP16 转置副本
+// 按 vocab_size 定步长，padding/截断都会让转置读错行。
+TEST(GGUFParser, RejectsMismatchedVocabDimension) {
+    for (uint64_t bad_vocab : {40u, 16u}) {
+        auto buf = headerWithTensors(3, 1);
+        pushTensorInfo(buf, "token_embd.weight", {8, bad_vocab});
+        const std::string path = tmpPath("shape_vocab");
+        writeFile(path, buf);
+
+        GGUFParser p(path);
+        ASSERT_TRUE(p.parse().isOk());
+        auto r = p.validateTensorShapes(smallConfig());
+        ASSERT_TRUE(r.isErr()) << "vocab=" << bad_vocab << " 与 config 32 不符，必须拒绝";
+        EXPECT_NE(r.error().find("token_embd.weight"), std::string::npos) << r.error();
+        EXPECT_NE(r.error().find("[8, 32]"), std::string::npos) << r.error();
+        std::remove(path.c_str());
+    }
+}
+
+// 配置不完整时不得进行形状校验（缺键回落默认值可能把错误形状判成匹配）。
+TEST(GGUFParser, RejectsShapeValidationWithIncompleteConfig) {
+    auto buf = headerWithTensors(3, 0);
+
+    const std::string path = tmpPath("shape_cfg");
+    writeFile(path, buf);
+
+    GGUFParser p(path);
+    ASSERT_TRUE(p.parse().isOk());
+    ModelConfig cfg = smallConfig();
+    cfg.num_layers = 0;
+    EXPECT_TRUE(p.validateTensorShapes(cfg).isErr());
 
     std::remove(path.c_str());
 }

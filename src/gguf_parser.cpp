@@ -2,8 +2,10 @@
 #include "tiny_llm/logger.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstring>
 #include <limits>
+#include <system_error>
 
 namespace tiny_llm {
 
@@ -564,6 +566,117 @@ Result<ModelConfig> GGUFParser::extractModelConfig() const {
     return Result<ModelConfig>::ok(config);
 }
 
+Result<void> GGUFParser::validateTensorShapes(const ModelConfig &config) const {
+    // 配置来自 metadata，缺失键时 extractModelConfig() 可能回落默认值；
+    // 用不完整的配置做形状校验会把错误张量判成“匹配”，必须显式拒绝。
+    if (config.hidden_dim <= 0 || config.num_layers <= 0 || config.num_heads <= 0 ||
+        config.num_kv_heads <= 0 || config.head_dim <= 0 || config.vocab_size <= 0 ||
+        config.intermediate_dim <= 0) {
+        return Result<void>::err(
+            "Cannot validate GGUF tensor shapes: incomplete ModelConfig "
+            "(hidden_dim/num_layers/num_heads/num_kv_heads/head_dim/vocab_size/"
+            "intermediate_dim must all be > 0)");
+    }
+
+    const uint64_t hidden = static_cast<uint64_t>(config.hidden_dim);
+    const uint64_t vocab = static_cast<uint64_t>(config.vocab_size);
+    const uint64_t inter = static_cast<uint64_t>(config.intermediate_dim);
+    const uint64_t q_dim =
+        static_cast<uint64_t>(config.num_heads) * static_cast<uint64_t>(config.head_dim);
+    const uint64_t kv_dim =
+        static_cast<uint64_t>(config.num_kv_heads) * static_cast<uint64_t>(config.head_dim);
+
+    auto format_dims = [](const std::vector<uint64_t> &dims) {
+        std::string out = "[";
+        for (size_t i = 0; i < dims.size(); ++i) {
+            if (i > 0) out += ", ";
+            out += std::to_string(dims[i]);
+        }
+        out += "]";
+        return out;
+    };
+
+    std::vector<std::string> mismatches;
+    auto                     mismatch = [&](const GGUFTensorInfo &t, const std::string &expected) {
+        mismatches.push_back("tensor " + t.name + " has shape " + format_dims(t.dimensions) +
+                                                 ", expected " + expected);
+    };
+    auto expect_exact = [&](const GGUFTensorInfo &t, std::vector<uint64_t> expected) {
+        if (t.dimensions != expected) {
+            mismatch(t, format_dims(expected));
+        }
+    };
+    // 词表维必须是精确值：lm_head_fp16 的转置副本按 config.vocab_size 定步长，
+    // 多出的 padding 列会让转置读错行（数值全错），少则越界/截断。
+    auto expect_vocab = [&](const GGUFTensorInfo &t) {
+        if (t.dimensions.size() != 2 || t.dimensions[0] != hidden || t.dimensions[1] != vocab) {
+            mismatch(t, "[" + std::to_string(hidden) + ", " + std::to_string(vocab) + "]");
+        }
+    };
+
+    // 去掉 "blk.N." / "layers.N." 前缀；层号越界或非逐层张量返回空（跳过）。
+    auto layer_suffix = [&](const std::string &name) -> std::string {
+        for (const char *prefix : {"blk.", "layers."}) {
+            if (name.rfind(prefix, 0) != 0) continue;
+            const size_t begin = std::strlen(prefix);
+            const size_t dot = name.find('.', begin);
+            if (dot == std::string::npos) return {};
+            long long   idx = 0;
+            const char *first = name.data() + begin;
+            const char *last = name.data() + dot;
+            auto [ptr, ec] = std::from_chars(first, last, idx);
+            if (ec != std::errc() || ptr != last || idx < 0 || idx >= config.num_layers) {
+                return {};
+            }
+            return name.substr(dot + 1);
+        }
+        return {};
+    };
+
+    for (const auto &t : tensors_) {
+        if (t.name == "token_embd.weight" || t.name == "tok_embeddings.weight" ||
+            t.name == "output.weight" || t.name == "lm_head.weight") {
+            expect_vocab(t);
+            continue;
+        }
+        if (t.name == "output_norm.weight" || t.name == "norm.weight") {
+            expect_exact(t, {hidden});
+            continue;
+        }
+
+        std::string suffix = layer_suffix(t.name);
+        if (suffix.empty()) continue;
+
+        if (suffix == "attn_q.weight") {
+            expect_exact(t, {hidden, q_dim});
+        } else if (suffix == "attn_k.weight" || suffix == "attn_v.weight") {
+            expect_exact(t, {hidden, kv_dim});
+        } else if (suffix == "attn_output.weight" || suffix == "attn_out.weight") {
+            expect_exact(t, {q_dim, hidden});
+        } else if (suffix == "ffn_gate.weight" || suffix == "ffn_up.weight") {
+            expect_exact(t, {hidden, inter});
+        } else if (suffix == "ffn_down.weight") {
+            expect_exact(t, {inter, hidden});
+        } else if (suffix == "attn_norm.weight" || suffix == "ffn_norm.weight") {
+            expect_exact(t, {hidden});
+        } else if (suffix == "attn_q.bias") {
+            expect_exact(t, {q_dim});
+        } else if (suffix == "attn_k.bias" || suffix == "attn_v.bias") {
+            expect_exact(t, {kv_dim});
+        }
+    }
+
+    if (!mismatches.empty()) {
+        std::string joined;
+        for (size_t i = 0; i < mismatches.size(); ++i) {
+            if (i > 0) joined += "; ";
+            joined += mismatches[i];
+        }
+        return Result<void>::err("GGUF tensor shape mismatch: " + joined);
+    }
+    return Result<void>::ok();
+}
+
 const GGUFTensorInfo *GGUFParser::getTensorByName(const std::string &name) const {
     auto it = tensor_name_map_.find(name);
     if (it != tensor_name_map_.end()) {
@@ -596,6 +709,14 @@ Result<std::vector<uint8_t>> GGUFParser::readTensorData(const GGUFTensorInfo &te
     size_t size = tensor.calculateSize();
     if (!tensor.dimensions.empty() && size == 0) {
         return Result<std::vector<uint8_t>>::err("Tensor size overflow or unsupported type for: " +
+                                                 tensor.name);
+    }
+    // 尺寸先与文件剩余字节比较，避免伪造 dimensions 触发先分配后读取：
+    // 旧路径会对一个几百字节的文件按声明尺寸分配数 GB，构造的 GGUF 可直接
+    // 触发 OOM-kill，而不是返回解析错误。readArray 已有同型检查。
+    const size_t remaining = remainingBytes(file);
+    if (size > remaining) {
+        return Result<std::vector<uint8_t>>::err("Tensor data exceeds remaining file bytes for: " +
                                                  tensor.name);
     }
     std::vector<uint8_t> data(size);

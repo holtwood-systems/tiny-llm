@@ -1,8 +1,8 @@
-// Q5_0 / Q4_K / Q6_K 反量化的单元测试。
+// Q4_0 / Q5_0 / Q4_K / Q6_K 反量化的单元测试。
 //
 // 期望值的来源：
 // 1. 合成块测试的期望值由 Python `gguf` 包的参考实现
-//    （gguf.quants.Q5_0/Q4_K/Q6_K.dequantize）对相同字节序列计算得出；
+//    （gguf.quants.Q4_0/Q5_0/Q4_K/Q6_K.dequantize）对相同字节序列计算得出；
 // 2. 真实模型测试（环境变量 TLLM_GGUF_TEST_MODEL 门控）的期望值由同一参考
 //    实现对 Qwen2.5-0.5B-Instruct Q4_K_M 文件的首块反量化结果得出。
 // 布局依据见 ggml/gguf 官方格式，不依赖本仓库自身实现计算期望值。
@@ -35,6 +35,37 @@ void expectNearF16(float actual, float expected, const char *ctx) {
 }
 
 } // namespace
+
+TEST(DequantizeQ4_0, NullPointerFails) {
+    auto r = dequantizeQ4_0(nullptr, 1);
+    EXPECT_TRUE(r.isErr());
+}
+
+TEST(DequantizeQ4_0, MatchesGGMLSplitHalfLayout) {
+    // 合成块: d=1.0, qs[i] = (i << 4) | (15 - i)。
+    // GGML 布局：值 i (i<16) 取 qs[i] 低 nibble，值 i+16 取 qs[i] 高 nibble。
+    // 低 nibble 依次为 15..0 -> -1..-8；高 nibble 依次为 0..15 -> 0..7。
+    // 旧的交错布局（2j 低 / 2j+1 高）会得到不同的顺序。
+    uint8_t block[18];
+    half    d = __float2half(1.0f);
+    std::memcpy(block, &d, sizeof(d));
+    for (int i = 0; i < 16; ++i) {
+        block[2 + i] = static_cast<uint8_t>((i << 4) | (15 - i));
+    }
+
+    auto r = dequantizeQ4_0(block, 1);
+    ASSERT_FALSE(r.isErr()) << r.error();
+    auto v = toFloats(r.value());
+    ASSERT_EQ(v.size(), 32u);
+    for (int i = 0; i < 16; ++i) {
+        const int q = (15 - i) > 7 ? (15 - i) - 16 : (15 - i);
+        EXPECT_FLOAT_EQ(v[i], static_cast<float>(q)) << "low nibble index " << i;
+    }
+    for (int i = 0; i < 16; ++i) {
+        const int q = i > 7 ? i - 16 : i;
+        EXPECT_FLOAT_EQ(v[16 + i], static_cast<float>(q)) << "high nibble index " << i;
+    }
+}
 
 TEST(DequantizeQ5_0, NullPointerFails) {
     auto r = dequantizeQ5_0(nullptr, 1);

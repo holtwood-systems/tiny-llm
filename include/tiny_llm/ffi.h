@@ -11,7 +11,11 @@
 //
 // 数据布局约定：
 //   - seq_ids 显式给出每序列 id；input_tokens / positions 是扁平化数组
-//     （seq_lens 描述每序列切分，与 seq_ids 对齐）
+//     （seq_lens 描述每序列切分，与 seq_ids 对齐），positions 不得为空。
+//     positions 不是可选提示：后端会校验它——prefill 段必须是 0..len-1
+//     的连续绝对位置，decode 段必须等于后端内部位置计数（即调用方的
+//     context_len - 1），decode 的 seq_len 必须为 1；不一致返回错误，
+//     避免 RoPE 位置 / KV 槽位静默错位。
 //   - block_tables 是扁平化数组；num_blocks[i] = 第 i 个序列的 block_tables
 //     长度，扁平化 block_tables 的总长为 sum(num_blocks)
 //   - logprobs_k == 0 不输出；否则 logprobs 至少容纳
@@ -28,6 +32,8 @@ extern "C" {
 typedef struct TinyLlmHandle TinyLlmHandle;
 
 typedef struct TinyLlmConfig {
+    // 6 个几何字段：0 = 由 GGUF 提取；非 0 时必须与 GGUF 一致，
+    // 否则 tinyllm_load 返回 NULL 并写入不匹配字段。
     int hidden_dim;
     int num_layers;
     int num_heads;

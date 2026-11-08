@@ -60,7 +60,7 @@ Tiny-LLM 将仓库表面保持得尽量小：CUDA/C++17 内核、W8A16 量化、
 |------|------|
 | W8A16 量化 kernel 与运行时路径 | ✅ 已实现，有差分测试 |
 | KV Cache 管理、采样（temperature/top-k/top-p） | ✅ 已实现 |
-| GGUF 解析与反量化（F16/F32/Q4_0/Q5_0/Q8_0/Q4_K/Q6_K） | ✅ 已实现，真实模型验证通过（见下） |
+| GGUF 解析与反量化（F16/F32/Q4_0/Q5_0/Q8_0/Q4_K/Q6_K） | ✅ 已实现；Q4_0/Q5_0/Q4_K/Q6_K 有合成块参考测试，真实模型 Q4_K_M 覆盖 Q5_0/Q4_K/Q6_K |
 | 架构感知配置提取（qwen2/llama/...） | ✅ 已实现，真实模型验证通过 |
 | tokenizer | ✅ 已实现，与 HuggingFace tokenizers 差分测试逐 id 对齐（30 例 417 token） |
 | 真实模型端到端生成 | ✅ Qwen2.5-0.5B-Instruct（Q4_K_M）在 RTX 3060 上验证通过 |
