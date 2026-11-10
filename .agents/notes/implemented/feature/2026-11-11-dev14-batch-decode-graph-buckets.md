@@ -37,14 +37,16 @@ scalar graph。metadata H2D、views 构造、`sequences[].position` 记账
 
 | 并发 | graph-scalar | batch graph（默认） | Δ |
 |---|---|---|---|
-| c1 | 284.3 | 281–284（同路径 B=1） | 0% |
-| c2 | 296.4 | 363.4 | +22.6% |
-| c4 | 306.4 | 410.9 | +34.1% |
-| c8 | 310.6 | 456.3 | +46.9% |
+| c1 | 284.3 | 281.9（同路径 B=1） | −0.8% |
+| c2 | 296.4 | 366.5 | +23.7% |
+| c4 | 306.4 | 410.6 | +34.0% |
+| c8 | 310.6 | 459.1 | +47.8% |
 
-TPOT p50：c2 −24%、c4 −32.8%、c8 −41.6%；TTFT p95 无 >10% 回退；
+TPOT p50：c2 −24.6%、c4 −32.8%、c8 −41.7%；TTFT p95 无 >10% 回退；
 重复极差 <1% 远小于收益。既定默认门槛（≥10% 收益、超噪声、c1
 回退≤5%、无 TTFT 回退、无正确性错误、收敛门）全部满足。
+（最终数字来自干净重跑：paged-serving `a9f9fa3` + tiny-llm
+`136c0d0` 均为已提交 HEAD，12/12 run 校验与收敛门全过。）
 
 ## Consequences
 
@@ -67,8 +69,8 @@ TPOT p50：c2 −24%、c4 −32.8%、c8 −41.6%；TTFT p95 无 >10% 回退；
   `TLLM_BATCH_DECODE=0` 显式关闭。
 - 全套 259 passed / 0 failed；memcheck 0 errors；racecheck 0 hazards
   （BatchDecode 三用例，含 graph 路径实跑）。
-- 端到端：paged-serving 重链后 v3 扫 9 run + 默认行为抽查 1 run，
-  数值与 env=1 一致（c8 453.5 tok/s）。
+- 端到端：paged-serving 重链后 v3 干净重跑 12 run + 默认行为抽查
+  1 run（无 env c8 458.1 tok/s，与 env=1 的 459.1 一致）。
 
 ## 备选方案
 
