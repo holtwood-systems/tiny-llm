@@ -19,12 +19,12 @@
 //     批量后处理失败等无法归属到单个序列的错误）。
 //
 // 数据布局约定：
-//   - seq_ids 显式给出每序列 id；input_tokens / positions 是扁平化数组
-//     （seq_lens 描述每序列切分，与 seq_ids 对齐），positions 不得为空。
-//     positions 不是可选提示：后端会校验它——prefill 段必须是 0..len-1
-//     的连续绝对位置，decode 段必须等于后端内部位置计数（即调用方的
-//     context_len - 1），decode 的 seq_len 必须为 1；不一致返回错误，
-//     避免 RoPE 位置 / KV 槽位静默错位。
+//   - seq_ids 显式给出每序列 id；input_tokens 是扁平化数组（seq_lens 描述
+//     每序列切分，与 seq_ids 对齐）。decode 的 seq_len 必须为 1，否则
+//     该序列按逐序列失败处理（seq_status），不算调用级违约。
+//   - positions 是签名保留的惰性参数：当前实现不读取、不校验，序列位置
+//     由后端 SeqState 内部跟踪（见下方"已声明但未生效的参数"）。调用方
+//     仍按现有布局传入真实值，但传入值不影响执行。
 //   - block_tables 是扁平化数组；num_blocks[i] = 第 i 个序列的 block_tables
 //     长度，扁平化 block_tables 的总长为 sum(num_blocks)
 //   - logprobs_k == 0 不输出；否则 logprobs 至少容纳
