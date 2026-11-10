@@ -762,7 +762,7 @@ TEST_F(FfiPagedDispatchTest, BatchDecodeMatchesScalarThroughCAbi) {
         return steps_tokens;
     };
 
-    bd.unset();
+    bd.set("0"); // DEV-14 起默认启用：baseline 须显式关闭批量路径
     const auto scalar = run();
     bd.set("1");
     const auto batched = run();
@@ -815,4 +815,106 @@ TEST_F(FfiPagedDispatchTest, BatchDecodeFallsBackForUnsupportedCounts) {
     }
     for (int s = 0; s < kSeqs; ++s)
         EXPECT_EQ(tinyllm_free_sequence(h.get(), s), 0);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// DEV-14：批量 decode graph 分桶 —— 同一 B 图服务任意行集。
+// 场景：B=4 decode 数步 → 释放 seq1、新分配 seq4（同 B 不同行集/槽位
+// 映射/块表）→ 继续 B=4 → 释放两条降为 B=2。批量路径必须经
+// d_batch_slots device 索引映回而非固化槽位；逐位 oracle 同 DEV-12。
+// ─────────────────────────────────────────────────────────────────
+TEST_F(FfiPagedDispatchTest, BatchDecodeGraphBucketsMatchScalar) {
+    EnvGuard bd("TLLM_BATCH_DECODE"), paged("TLLM_PAGED_ATTENTION");
+    auto     h = loadPaged(model_path_.c_str());
+    ASSERT_NE(h, nullptr);
+
+    const int init_lens[4] = {48, 32, 16, 48};
+    const int all_blocks[5][5] = {{3, 17, 9, 31, 22},
+                                  {6, 28, 14, 30, 1},
+                                  {11, 25, 4, 20, 19},
+                                  {24, 8, 26, 13, 27},
+                                  {2, 15, 21, 29, 5}}; // seq4 后续替换 seq1 用
+
+    auto do_prefill = [&](int slot, int seq_id, int len, const int *blocks) {
+        (void)slot; // 槽位仅是调用方数组下标；分配/释放按 seq_id
+        EXPECT_EQ(tinyllm_allocate_sequence(h.get(), seq_id, 96), 0);
+        int              sid[] = {seq_id}, lens[] = {len}, nx = -1;
+        unsigned char    pre[] = {1};
+        std::vector<int> prompt(len), pos(len);
+        for (int i = 0; i < len; ++i) {
+            prompt[i] = (i * 7 + seq_id) % 128;
+            pos[i] = i;
+        }
+        int nb = len / kBlockSize;
+        EXPECT_EQ(tinyllm_step(h.get(), sid, prompt.data(), pos.data(), lens, blocks, &nb, pre, 1,
+                               &nx, nullptr, 0, seq_status),
+                  0);
+        EXPECT_EQ(seq_status[0], TLLM_SEQ_OK) << "prefill seq " << seq_id;
+        return nx;
+    };
+
+    auto run = [&]() {
+        std::vector<std::vector<int>> tokens_log;
+        int                           next_tok[5] = {0};
+        for (int s = 0; s < 4; ++s) next_tok[s] = do_prefill(s, s, init_lens[s], all_blocks[s]);
+        int cur_len[5] = {init_lens[0], init_lens[1], init_lens[2], init_lens[3], 0};
+
+        // decode 一段：按当前 seq_ids/位置推进 n 步
+        auto decode_steps = [&](const std::vector<int> &seq_ids, int steps) {
+            const int n = static_cast<int>(seq_ids.size());
+            for (int step = 0; step < steps; ++step) {
+                int              sids[8], toks[8], pos[8], slens[8], nbs[8], next[8];
+                unsigned char    dec[8];
+                std::vector<int> flat;
+                for (int s = 0; s < n; ++s) {
+                    const int id = seq_ids[s];
+                    sids[s] = id;
+                    toks[s] = next_tok[id] >= 0 ? next_tok[id] : kFeedToken;
+                    pos[s] = cur_len[id];
+                    slens[s] = 1;
+                    dec[s] = 0;
+                    nbs[s] = (pos[s] + 1 + kBlockSize - 1) / kBlockSize;
+                    EXPECT_LE(nbs[s], 5);
+                    for (int b = 0; b < nbs[s]; ++b) flat.push_back(all_blocks[id][b]);
+                    next[s] = -1;
+                }
+                EXPECT_EQ(tinyllm_step(h.get(), sids, toks, pos, slens, flat.data(), nbs, dec, n,
+                                       next, nullptr, 0, seq_status),
+                          0);
+                std::vector<int> row(n);
+                for (int s = 0; s < n; ++s) {
+                    EXPECT_EQ(seq_status[s], TLLM_SEQ_OK)
+                        << "step " << step << " seq " << seq_ids[s];
+                    row[s] = next[s];
+                    next_tok[seq_ids[s]] = next[s];
+                }
+                tokens_log.push_back(row);
+            }
+            for (int id : seq_ids) cur_len[id] += steps;
+        };
+
+        decode_steps({0, 1, 2, 3}, 6); // B=4 桶：首次 eager + 捕获，后续重放
+
+        // seq1 退出 → 新 seq4 占槽1（不同 prompt 长、不同块表）：行集变化
+        // 但 B 不变 → 同一张 B=4 图必须仍正确（device 槽位索引映回）。
+        EXPECT_EQ(tinyllm_free_sequence(h.get(), 1), 0);
+        cur_len[4] = 16;
+        next_tok[4] = do_prefill(1, 4, 16, all_blocks[4]);
+        decode_steps({0, 4, 2, 3}, 6); // 复用 B=4 graph，行集 {0,4,2,3}
+
+        // 降为 B=2：释放 seq4 与 seq0 → seq{2,3} 继续
+        EXPECT_EQ(tinyllm_free_sequence(h.get(), 4), 0);
+        EXPECT_EQ(tinyllm_free_sequence(h.get(), 0), 0);
+        decode_steps({2, 3}, 4); // B=2 桶
+
+        for (int id : {2, 3}) EXPECT_EQ(tinyllm_free_sequence(h.get(), id), 0);
+        return tokens_log;
+    };
+
+    bd.set("0"); // baseline 走逐序列路径（默认批量显式关闭）
+    const auto scalar = run();
+    bd.set("1");
+    const auto batched = run();
+
+    EXPECT_EQ(batched, scalar);
 }

@@ -19,6 +19,11 @@ void silu_mul_inplace(half *gate, const half *up, int num_elements, cudaStream_t
 void gather_embeddings(const int *tokens, const half *embedding, half *output, int num_tokens,
                        int hidden_dim, int vocab_size, cudaStream_t stream = 0);
 
+// 行索引 gather：dst[dst_rows[r], :] = src[r, :]。dst_rows 是 device int[num_rows]——
+// 行→槽映射作为 device 数据读取，CUDA Graph 重放时只需更新该缓冲（DEV-14）。
+void copy_rows_indexed(half *dst, const half *src, const int *dst_rows, int num_rows,
+                       int row_elems, cudaStream_t stream = 0);
+
 // 任务 3.2：KV append 的 device 写位置版本。把当前 step 的 K/V 写入 cache 的
 // *device_write_pos 位置（CUDA Graph 重放：host 更新 device 位置后重放即可，
 // 不像 host 计算的目标地址会被 graph 固化）。new_k/new_v 都是 [num_tokens, kv_heads*D]；

@@ -2,6 +2,10 @@
 
 Status: implemented
 
+> **Superseded（门集合与默认值）by** `2026-11-11-dev14-batch-decode-graph-buckets.md`：
+> 批量 graph 分桶后行数门恢复 {2,4,8} 且默认启用（=0 关闭）；本篇记录的
+> 行压缩/metadata/逐行 attention 接线仍然有效。
+
 ## Problem
 
 DEV-10 设计包要求把策略 1 纯 decode 行的层主体 GEMM 从逐序列循环改为

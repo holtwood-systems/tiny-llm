@@ -2,6 +2,11 @@
 
 Status: implemented
 
+> **Superseded by** `.agents/notes/implemented/feature/2026-11-11-dev14-batch-decode-graph-buckets.md`（同日）：
+> DEV-14 批量 graph 分桶使 B=2 也占优且全部门槛通过，`TLLM_BATCH_DECODE`
+> 已翻为**默认启用（=0 关闭）**，门恢复 {2,4,8}。本篇保留 A/B 方法与
+> 「eager 批量 vs graph 是两条开销轴」的机制结论。
+
 ## Problem
 
 DEV-12 交付的 `TLLM_BATCH_DECODE` opt-in 路径需要端到端判定：相对

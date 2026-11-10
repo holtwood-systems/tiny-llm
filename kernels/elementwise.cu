@@ -47,7 +47,30 @@ __global__ void add_bias_kernel(half *data, const half *bias, int cols, int tota
     float b = __half2float(bias[idx % cols]);
     data[idx] = __float2half(__half2float(data[idx]) + b);
 }
+__global__ void copy_rows_indexed_kernel(half *dst, const half *src, const int *dst_rows,
+                                        int num_rows, int row_elems) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_rows * row_elems;
+    if (idx >= total) {
+        return;
+    }
+    const int r = idx / row_elems;
+    const int c = idx - r * row_elems;
+    const int s = dst_rows[r];
+    dst[static_cast<size_t>(s) * row_elems + c] = src[static_cast<size_t>(r) * row_elems + c];
+}
 } // namespace
+
+void copy_rows_indexed(half *dst, const half *src, const int *dst_rows, int num_rows,
+                       int row_elems, cudaStream_t stream) {
+    if (num_rows <= 0 || row_elems <= 0 || !dst || !src || !dst_rows) {
+        return;
+    }
+    const int total = num_rows * row_elems;
+    const int block_size = 256;
+    copy_rows_indexed_kernel<<<(total + block_size - 1) / block_size, block_size, 0, stream>>>(
+        dst, src, dst_rows, num_rows, row_elems);
+}
 
 void add_bias_inplace(half *data, const half *bias, int rows, int cols, cudaStream_t stream) {
     if (rows <= 0 || cols <= 0 || data == nullptr || bias == nullptr) return;

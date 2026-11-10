@@ -87,6 +87,10 @@ struct TinyLlmHandleImpl {
         // FFI decode graph（exec 先于 graph 销毁）
         if (ffi_graph_exec != nullptr) cudaGraphExecDestroy(ffi_graph_exec);
         if (ffi_decode_graph != nullptr) cudaGraphDestroy(ffi_decode_graph);
+        for (int b = 0; b < 9; ++b) {
+            if (ffi_batch_graph_exec[b] != nullptr) cudaGraphExecDestroy(ffi_batch_graph_exec[b]);
+            if (ffi_batch_graph[b] != nullptr) cudaGraphDestroy(ffi_batch_graph[b]);
+        }
         if (g_hidden_row) cudaFree(g_hidden_row);
         if (rope_cos) cudaFree(rope_cos);
         if (rope_sin) cudaFree(rope_sin);
@@ -119,14 +123,24 @@ struct TinyLlmHandleImpl {
     int g_len_host = 0;
     int g_pos_host = 0;
 
-    // ── DEV-12 decode 行批量前向（TLLM_BATCH_DECODE=1，opt-in eager）──
-    // 行数集合为 kernel 模板实例 {2,4,8} 的子集 {4,8}（DEV-13：B=2 时 graph
-    // 重放优于 eager 批量，故不进入）；eager 路径不建/不碰 graph。
+    // ── DEV-12 decode 行批量前向（TLLM_BATCH_DECODE=1，opt-in）──
+    // 行数集合为 kernel 模板实例 {2,4,8}；B=2 的进入条件由 DEV-14 批量
+    // graph 保证（批量 graph 一次重放 < 两次 scalar graph 重放）。
     tiny_llm::DeviceBuffer<int>  d_batch_token_in;     // [8]
     tiny_llm::DeviceBuffer<int>  d_batch_rope_pos;     // [8]
     tiny_llm::DeviceBuffer<int>  d_batch_decode_len;   // [8]
     tiny_llm::DeviceBuffer<int>  d_batch_block_tables; // [8 * max_num_blocks]
     tiny_llm::DeviceBuffer<half> d_batch_work;         // [8 * hidden]
+    tiny_llm::DeviceBuffer<int>  d_batch_slots;        // [8] 行→原槽映射
+
+    // ── DEV-14 批量 decode graph 分桶（每 B 一张；graphs 关闭时保持 eager）──
+    // 与 scalar graph 同一设计：固化地址均为 handle 级固定缓冲（d_batch_*），
+    // 行差异（token/位置/可见长度/块表内容/槽位映射）全部经 device 数据表达，
+    // 一张 B 图服务任意行集。B 索引直达数组；捕获失败的 B 标记后保持 eager。
+    bool            ffi_batch_graph_captured[9] = {};
+    bool            ffi_batch_graph_failed[9] = {};
+    cudaGraph_t     ffi_batch_graph[9] = {};
+    cudaGraphExec_t ffi_batch_graph_exec[9] = {};
 };
 
 // ── 内部工具 ─────────────────────────────────────────────
@@ -206,35 +220,14 @@ struct FfiBatchDecodeRow {
 
 constexpr int kFfiBatchDecodeMax = 8;
 
-tiny_llm::Result<void> runFfiPagedDecodeBatch(TinyLlmHandleImpl                     *h,
-                                              const std::vector<FfiBatchDecodeRow> &rows) {
+// 批量 decode 的可捕获 device 路径：B 行 embed → 逐层 forwardPagedBatch →
+// 末层 hidden 经 d_batch_slots 索引映回原槽。块表/metadata H2D 上传与
+// sequences[].position 记账在 capture 之外由调用方驱动（与 scalar 同构）。
+tiny_llm::Result<void> runFfiPagedDecodeBatchDevice(
+    TinyLlmHandleImpl *h, const std::vector<FfiBatchDecodeRow> &rows) {
     const int    B = static_cast<int>(rows.size());
     const int    hidden = h->config.hidden_dim;
     const size_t bt_stride = static_cast<size_t>(h->max_num_blocks);
-    if (h->d_batch_token_in.size() < kFfiBatchDecodeMax) {
-        h->d_batch_token_in = tiny_llm::DeviceBuffer<int>(kFfiBatchDecodeMax);
-        h->d_batch_rope_pos = tiny_llm::DeviceBuffer<int>(kFfiBatchDecodeMax);
-        h->d_batch_decode_len = tiny_llm::DeviceBuffer<int>(kFfiBatchDecodeMax);
-        h->d_batch_block_tables =
-            tiny_llm::DeviceBuffer<int>(static_cast<size_t>(kFfiBatchDecodeMax) * bt_stride);
-        h->d_batch_work = tiny_llm::DeviceBuffer<half>(
-            static_cast<size_t>(kFfiBatchDecodeMax) * static_cast<size_t>(hidden));
-    }
-
-    int toks[kFfiBatchDecodeMax], poss[kFfiBatchDecodeMax], lens[kFfiBatchDecodeMax];
-    for (int r = 0; r < B; ++r) {
-        toks[r] = rows[r].token;
-        poss[r] = rows[r].pos;
-        lens[r] = rows[r].pos + 1;
-    }
-    h->d_batch_token_in.copyFromHost(toks, static_cast<size_t>(B), h->stream);
-    h->d_batch_rope_pos.copyFromHost(poss, static_cast<size_t>(B), h->stream);
-    h->d_batch_decode_len.copyFromHost(lens, static_cast<size_t>(B), h->stream);
-    for (int r = 0; r < B; ++r) {
-        CUDA_CHECK(cudaMemcpyAsync(h->d_batch_block_tables.data() + r * bt_stride, rows[r].bt,
-                                   static_cast<size_t>(rows[r].nb) * sizeof(int),
-                                   cudaMemcpyHostToDevice, h->stream));
-    }
 
     tiny_llm::kernels::gather_embeddings(h->d_batch_token_in.data(), h->weights.token_embedding,
                                          h->d_batch_work.data(), B, hidden, h->config.vocab_size,
@@ -248,11 +241,15 @@ tiny_llm::Result<void> runFfiPagedDecodeBatch(TinyLlmHandleImpl                 
         v.block_table = h->d_batch_block_tables.data() + r * bt_stride;
         v.k_scratch = h->paged_k_scratch;
         v.v_scratch = h->paged_v_scratch;
-        v.visible_blocks = rows[r].nb;
+        // graph 安全（DEV-14）：visible_blocks 固化进 attention kernel 的
+        // table_len 参数；其语义仅是 (b < table_len) 越界保护，实际遍历由
+        // device decode_len 界定。扁平表行 stride 恒为 max_num_blocks，
+        // 传常量使同一 B 图服务任意行集（nb 校验仍由调用方预扫描承担）。
+        v.visible_blocks = h->max_num_blocks;
         v.block_size = h->block_size;
         v.max_num_blocks = h->max_num_blocks;
         v.max_visible_tokens = h->max_visible_tokens;
-        v.position = rows[r].pos; // host 校验与 visible_blocks 推导用
+        v.position = rows[r].pos; // host 校验用（capture 时值仅作健全性检查）
         v.decode_len = h->d_batch_decode_len.data() + r;
         v.position_dev = nullptr; // scatter 位置走 d_batch_rope_pos（forwardPagedBatch 参数）
     }
@@ -265,17 +262,15 @@ tiny_llm::Result<void> runFfiPagedDecodeBatch(TinyLlmHandleImpl                 
             return r;
         }
     }
-    // 末层 hidden 映回原始槽位（与 queue_hidden_for_batch 同一 stream 语义）
-    for (int r = 0; r < B; ++r) {
-        CUDA_CHECK(cudaMemcpyAsync(h->d_batch_hidden.data() +
-                                       static_cast<size_t>(rows[r].s) * hidden,
-                                   h->d_batch_work.data() + static_cast<size_t>(r) * hidden,
-                                   static_cast<size_t>(hidden) * sizeof(half),
-                                   cudaMemcpyDeviceToDevice, h->stream));
-        h->sequences[rows[r].seq_id].position = rows[r].pos + 1;
-    }
+    // 末层 hidden 经 device 槽位表映回原槽（graph 重放：槽位映射随 metadata
+    // H2D 更新，kernel 从 device 读取，不被固化）。
+    tiny_llm::kernels::copy_rows_indexed(h->d_batch_hidden.data(), h->d_batch_work.data(),
+                                         h->d_batch_slots.data(), B, hidden, h->stream);
     return tiny_llm::Result<void>::ok();
 }
+
+tiny_llm::Result<void> runFfiPagedDecodeBatch(TinyLlmHandleImpl                     *h,
+                                              const std::vector<FfiBatchDecodeRow> &rows);
 
 // 策略 1 decode：graph 已捕获则重放；未捕获则先直接执行本步，再捕获并实例化
 // （capture 不执行 kernel，本步结果来自直接执行）。任何捕获失败都关闭
@@ -341,6 +336,120 @@ tiny_llm::Result<void> runFfiPagedDecodeGraphed(TinyLlmHandleImpl               
     h->ffi_graph_captured = true;
     if (std::getenv("TLLM_FFI_DEBUG")) {
         fprintf(stderr, "  [ffi] paged decode graph captured\n");
+    }
+    return tiny_llm::Result<void>::ok();
+}
+
+// DEV-14 批量 decode 分桶 graph：B∈{2,4,8} 每 B 一张，结构与 scalar 镜像。
+// 本步已由直接执行完成后再捕获；该 B 捕获失败标 failed[B] 保持 eager，
+// 不影响其它 B，也不关闭 scalar graph 机制。
+tiny_llm::Result<void> runFfiPagedDecodeBatchGraphed(
+    TinyLlmHandleImpl *h, const std::vector<FfiBatchDecodeRow> &rows) {
+    const int B = static_cast<int>(rows.size());
+    if (h->ffi_graphs_enabled && h->ffi_batch_graph_captured[B]) {
+        CUDA_CHECK(cudaGraphLaunch(h->ffi_batch_graph_exec[B], h->stream));
+        return tiny_llm::Result<void>::ok();
+    }
+    if (!h->ffi_graphs_enabled || h->ffi_batch_graph_failed[B]) {
+        return runFfiPagedDecodeBatchDevice(h, rows);
+    }
+
+    auto direct = runFfiPagedDecodeBatchDevice(h, rows);
+    if (direct.isErr()) {
+        return direct;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(h->stream));
+
+    bool capture_ok = false;
+    try {
+        cudaError_t begin_err = cudaStreamBeginCapture(h->stream, cudaStreamCaptureModeThreadLocal);
+        if (begin_err == cudaSuccess) {
+            auto        capture_result = runFfiPagedDecodeBatchDevice(h, rows);
+            cudaError_t end_err =
+                cudaStreamEndCapture(h->stream, &h->ffi_batch_graph[B]);
+            capture_ok = capture_result.isOk() && end_err == cudaSuccess;
+            if (!capture_ok && h->ffi_batch_graph[B] != nullptr) {
+                cudaGraphDestroy(h->ffi_batch_graph[B]);
+                h->ffi_batch_graph[B] = nullptr;
+            }
+        }
+    } catch (const tiny_llm::CudaException &) {
+        cudaStreamEndCapture(h->stream, &h->ffi_batch_graph[B]);
+        if (h->ffi_batch_graph[B] != nullptr) {
+            cudaGraphDestroy(h->ffi_batch_graph[B]);
+            h->ffi_batch_graph[B] = nullptr;
+        }
+        capture_ok = false;
+    }
+
+    if (!capture_ok) {
+        if (std::getenv("TLLM_FFI_DEBUG")) {
+            fprintf(stderr, "  [ffi] batch decode graph B=%d capture failed; staying eager\n", B);
+        }
+        h->ffi_batch_graph_failed[B] = true;
+        return tiny_llm::Result<void>::ok();
+    }
+    cudaError_t inst_err = cudaGraphInstantiate(&h->ffi_batch_graph_exec[B],
+                                                h->ffi_batch_graph[B], nullptr, nullptr, 0);
+    if (inst_err != cudaSuccess) {
+        if (std::getenv("TLLM_FFI_DEBUG")) {
+            fprintf(stderr, "  [ffi] batch decode graph B=%d instantiate failed: %s\n", B,
+                    cudaGetErrorString(inst_err));
+        }
+        cudaGraphDestroy(h->ffi_batch_graph[B]);
+        h->ffi_batch_graph[B] = nullptr;
+        h->ffi_batch_graph_failed[B] = true;
+        return tiny_llm::Result<void>::ok();
+    }
+    h->ffi_batch_graph_captured[B] = true;
+    if (std::getenv("TLLM_FFI_DEBUG")) {
+        fprintf(stderr, "  [ffi] batch decode graph B=%d captured\n", B);
+    }
+    return tiny_llm::Result<void>::ok();
+}
+
+// 批量 decode 入口：metadata 上传（capture 之外）→ graphed/eager 分发 →
+// 逐行 position 记账（host 侧，重放步同样执行）。
+tiny_llm::Result<void> runFfiPagedDecodeBatch(
+    TinyLlmHandleImpl *h, const std::vector<FfiBatchDecodeRow> &rows) {
+    const int    B = static_cast<int>(rows.size());
+    const size_t bt_stride = static_cast<size_t>(h->max_num_blocks);
+    if (h->d_batch_token_in.size() < kFfiBatchDecodeMax) {
+        const int hidden = h->config.hidden_dim;
+        h->d_batch_token_in = tiny_llm::DeviceBuffer<int>(kFfiBatchDecodeMax);
+        h->d_batch_rope_pos = tiny_llm::DeviceBuffer<int>(kFfiBatchDecodeMax);
+        h->d_batch_decode_len = tiny_llm::DeviceBuffer<int>(kFfiBatchDecodeMax);
+        h->d_batch_slots = tiny_llm::DeviceBuffer<int>(kFfiBatchDecodeMax);
+        h->d_batch_block_tables =
+            tiny_llm::DeviceBuffer<int>(static_cast<size_t>(kFfiBatchDecodeMax) * bt_stride);
+        h->d_batch_work = tiny_llm::DeviceBuffer<half>(
+            static_cast<size_t>(kFfiBatchDecodeMax) * static_cast<size_t>(hidden));
+    }
+
+    int toks[kFfiBatchDecodeMax], poss[kFfiBatchDecodeMax], lens[kFfiBatchDecodeMax],
+        slots[kFfiBatchDecodeMax];
+    for (int r = 0; r < B; ++r) {
+        toks[r] = rows[r].token;
+        poss[r] = rows[r].pos;
+        lens[r] = rows[r].pos + 1;
+        slots[r] = rows[r].s;
+    }
+    h->d_batch_token_in.copyFromHost(toks, static_cast<size_t>(B), h->stream);
+    h->d_batch_rope_pos.copyFromHost(poss, static_cast<size_t>(B), h->stream);
+    h->d_batch_decode_len.copyFromHost(lens, static_cast<size_t>(B), h->stream);
+    h->d_batch_slots.copyFromHost(slots, static_cast<size_t>(B), h->stream);
+    for (int r = 0; r < B; ++r) {
+        CUDA_CHECK(cudaMemcpyAsync(h->d_batch_block_tables.data() + r * bt_stride, rows[r].bt,
+                                   static_cast<size_t>(rows[r].nb) * sizeof(int),
+                                   cudaMemcpyHostToDevice, h->stream));
+    }
+
+    auto res = runFfiPagedDecodeBatchGraphed(h, rows);
+    if (res.isErr()) {
+        return res;
+    }
+    for (const auto &row : rows) {
+        h->sequences[row.seq_id].position = row.pos + 1;
     }
     return tiny_llm::Result<void>::ok();
 }
@@ -678,19 +787,23 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
         }
     }
 
-    // ── DEV-12：decode 行批量前向（TLLM_BATCH_DECODE=1 候选开关，默认关闭）──
+    // ── DEV-12/14：decode 行批量前向（TLLM_BATCH_DECODE 默认启用，=0 关闭）──
     // 预扫描与主循环同一套 ABI 语义：收集策略 1 纯 decode、logprobs_k==0、
-    // 校验通过的行；行数恰为 {4,8} 时整体走 forwardPagedBatch（eager，不建
-    // graph），否则全部行回落既有逐序列路径，行为与开关关闭完全一致。
-    // B=2 排除（DEV-13 实测）：graph 重放的单行收益 > B=2 eager 批量摊薄，
-    // graph-batch 在 c2 下相对 graph-scalar 回退 ~11%；{4,8} 时批量全胜。
+    // 校验通过的行；行数恰为 {2,4,8} 时整体走批量前向（graphs 开启时经
+    // per-B graph 分桶，关闭时 eager），否则全部行回落既有逐序列路径，
+    // 行为与开关关闭完全一致。DEV-13 实测：B=2 仅当以批量 graph 形式执行
+    // 才优于逐序列 graph 重放（eager 批量在 c2 回退 ~11%），故 B=2 依赖
+    // DEV-14 的 graph 分桶而非 eager。
     std::vector<char> batch_handled(static_cast<size_t>(num_sequences), 0);
     bool              batch_ok = false;
     {
+        // DEV-14 起默认启用（TLLM_BATCH_DECODE=0 显式关闭）：分桶 graph 使
+        // B∈{2,4,8} 在所有并发下不劣于逐序列 graph 基线（DEV-13 v3 实测
+        // c2 +23% / c4 +34% / c8 +47%），不满足行集合时自动回落。
         const char *bd_env = std::getenv("TLLM_BATCH_DECODE");
         const bool  batch_decode_enabled =
-            h->paged_kv && batch_device_postprocess && bd_env != nullptr &&
-            std::string(bd_env) == "1";
+            h->paged_kv && batch_device_postprocess &&
+            !(bd_env != nullptr && bd_env[0] == '0' && bd_env[1] == '\0');
         if (batch_decode_enabled) {
             std::vector<FfiBatchDecodeRow> rows;
             int                            off2 = 0, toff2 = 0;
@@ -723,7 +836,7 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
                 rows.push_back({s, seq_ids[s], st.position, nb, bt, toks[0]});
             }
             const size_t bsz = rows.size();
-            if (bsz == 4 || bsz == 8) {
+            if (bsz == 2 || bsz == 4 || bsz == 8) {
                 batch_ok = runFfiPagedDecodeBatch(h, rows).isOk();
                 for (const auto &r : rows) batch_handled[static_cast<size_t>(r.s)] = 1;
                 if (std::getenv("TLLM_FFI_DEBUG")) {
@@ -732,7 +845,7 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
                 }
             } else if (bsz > 0 && std::getenv("TLLM_FFI_DEBUG")) {
                 fprintf(stderr,
-                        "  [ffi] TLLM_BATCH_DECODE: %zu rows -> fallback (B not in {4,8})\n",
+                        "  [ffi] TLLM_BATCH_DECODE: %zu rows -> fallback (B not in {2,4,8})\n",
                         bsz);
             }
         }
