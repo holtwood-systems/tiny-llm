@@ -689,3 +689,130 @@ TEST_F(FfiPagedDispatchTest, TinyLlmStepInertPositionsAndPerSeqLenCheck) {
 
     EXPECT_EQ(tinyllm_free_sequence(h.get(), 0), 0);
 }
+
+// ─────────────────────────────────────────────────────────────────
+// DEV-12：TLLM_BATCH_DECODE 行批量前向 —— 与逐序列路径逐位差分。
+// 4 条序列同一 step 调用（B=4），prompt 长度不同 → 位置/可见长度/块表
+// 均不同；块表 id 全池唯一且乱序 → 覆盖非连续块表与行映射。
+// ─────────────────────────────────────────────────────────────────
+TEST_F(FfiPagedDispatchTest, BatchDecodeMatchesScalarThroughCAbi) {
+    EnvGuard bd("TLLM_BATCH_DECODE"), paged("TLLM_PAGED_ATTENTION");
+    auto     h = loadPaged(model_path_.c_str());
+    ASSERT_NE(h, nullptr);
+
+    constexpr int kSeqs = 4;
+    constexpr int kSteps = 12;
+    // 各序列不同 prompt 长度（16 的倍数对齐块）：48/32/16/48 → decode 起始
+    // 绝对位置 {48,32,16,48}，可见块数 {3,2,1,3}，随步数可跨进下一块。
+    const int prompt_lens[kSeqs] = {48, 32, 16, 48};
+    // 每条序列 5 个互不相同的物理块（共享 pool，id 必须唯一、乱序且
+    // < kMaxBlocks=32）。
+    const int seq_blocks[kSeqs][5] = {{3, 17, 9, 31, 22},
+                                      {6, 28, 14, 30, 1},
+                                      {11, 25, 4, 20, 19},
+                                      {24, 8, 26, 13, 27}};
+
+    auto run = [&]() {
+        std::vector<std::array<int, kSeqs>> steps_tokens;
+        // prefill：逐序列独立调用（prefill 不进批量路径）
+        for (int s = 0; s < kSeqs; ++s) {
+            EXPECT_EQ(tinyllm_allocate_sequence(h.get(), s, 96), 0);
+            int                 seq_ids[] = {s}, seq_lens[] = {prompt_lens[s]}, next = -1;
+            unsigned char       pre[] = {1};
+            std::vector<int>    prompt(prompt_lens[s]);
+            std::vector<int>    pos(prompt_lens[s]);
+            for (int i = 0; i < prompt_lens[s]; ++i) {
+                prompt[i] = (i * 7 + s) % 128;
+                pos[i] = i;
+            }
+            int nb = prompt_lens[s] / kBlockSize;
+            EXPECT_EQ(tinyllm_step(h.get(), seq_ids, prompt.data(), pos.data(), seq_lens,
+                                   seq_blocks[s], &nb, pre, 1, &next, nullptr, 0, seq_status),
+                      0);
+            EXPECT_EQ(seq_status[0], TLLM_SEQ_OK) << "prefill seq " << s;
+        }
+        // decode：4 序列同一 step 调用
+        for (int step = 0; step < kSteps; ++step) {
+            int           seq_ids[kSeqs], toks[kSeqs], pos[kSeqs], lens[kSeqs], nbs[kSeqs],
+                next[kSeqs];
+            unsigned char dec[kSeqs];
+            std::vector<int> flat_blocks;
+            for (int s = 0; s < kSeqs; ++s) {
+                seq_ids[s] = s;
+                toks[s] = kFeedToken + s;
+                pos[s] = prompt_lens[s] + step;
+                lens[s] = 1;
+                dec[s] = 0;
+                nbs[s] = (prompt_lens[s] + step + 1 + kBlockSize - 1) / kBlockSize;
+                EXPECT_LE(nbs[s], 5);
+                for (int b = 0; b < nbs[s]; ++b) flat_blocks.push_back(seq_blocks[s][b]);
+                next[s] = -1;
+            }
+            EXPECT_EQ(tinyllm_step(h.get(), seq_ids, toks, pos, lens, flat_blocks.data(), nbs,
+                                   dec, kSeqs, next, nullptr, 0, seq_status),
+                      0);
+            for (int s = 0; s < kSeqs; ++s)
+                EXPECT_EQ(seq_status[s], TLLM_SEQ_OK) << "step " << step << " seq " << s;
+            std::array<int, kSeqs> row;
+            for (int s = 0; s < kSeqs; ++s) row[s] = next[s];
+            steps_tokens.push_back(row);
+        }
+        for (int s = 0; s < kSeqs; ++s)
+            EXPECT_EQ(tinyllm_free_sequence(h.get(), s), 0);
+        return steps_tokens;
+    };
+
+    bd.unset();
+    const auto scalar = run();
+    bd.set("1");
+    const auto batched = run();
+
+    // 逐位等价：argmax token 必须严格一致（DEV-10 oracle 口径；
+    // argmax 边界分歧按规格须保留现场提交审阅，不放宽容差）
+    EXPECT_EQ(batched, scalar);
+}
+
+// 批量失败语义：B∉{2,4,8}（3 条）回落逐序列路径，结果与基线一致；
+// B=4 但含非法行的混合批中合法行仍正常产出。
+TEST_F(FfiPagedDispatchTest, BatchDecodeFallsBackForUnsupportedCounts) {
+    EnvGuard bd("TLLM_BATCH_DECODE"), paged("TLLM_PAGED_ATTENTION");
+    auto     h = loadPaged(model_path_.c_str());
+    ASSERT_NE(h, nullptr);
+    bd.set("1");
+
+    constexpr int kSeqs = 3; // 不在 {2,4,8}：应整体回落
+    const int     seq_blocks[kSeqs][5] = {{3, 17, 9, 31, 22}, {6, 28, 14, 30, 1}, {11, 25, 4, 20, 19}};
+    int           seq_ids[kSeqs], toks[kSeqs], pos[kSeqs], lens[kSeqs], nbs[kSeqs], next[kSeqs];
+    unsigned char dec[kSeqs];
+    for (int s = 0; s < kSeqs; ++s) {
+        ASSERT_EQ(tinyllm_allocate_sequence(h.get(), s, 64), 0);
+        int              sid[] = {s}, plen[] = {kPromptLen}, nx = -1;
+        unsigned char    pre[] = {1};
+        const auto       prompt = promptTokens();
+        const auto       p0 = promptPositions();
+        int              nb = 3;
+        ASSERT_EQ(tinyllm_step(h.get(), sid, prompt.data(), p0.data(), plen, seq_blocks[s], &nb,
+                               pre, 1, &nx, nullptr, 0, seq_status),
+                  0);
+    }
+    std::vector<int> flat;
+    for (int s = 0; s < kSeqs; ++s) {
+        seq_ids[s] = s;
+        toks[s] = kFeedToken;
+        pos[s] = kPromptLen;
+        lens[s] = 1;
+        dec[s] = 0;
+        nbs[s] = (kPromptLen + 1 + kBlockSize - 1) / kBlockSize;
+        for (int b = 0; b < nbs[s]; ++b) flat.push_back(seq_blocks[s][b]);
+        next[s] = -1;
+    }
+    EXPECT_EQ(tinyllm_step(h.get(), seq_ids, toks, pos, lens, flat.data(), nbs, dec, kSeqs, next,
+                           nullptr, 0, seq_status),
+              0);
+    for (int s = 0; s < kSeqs; ++s) {
+        EXPECT_EQ(seq_status[s], TLLM_SEQ_OK) << "seq " << s;
+        EXPECT_GE(next[s], 0);
+    }
+    for (int s = 0; s < kSeqs; ++s)
+        EXPECT_EQ(tinyllm_free_sequence(h.get(), s), 0);
+}

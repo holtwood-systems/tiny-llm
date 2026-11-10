@@ -337,6 +337,161 @@ Result<void> TransformerLayer::forwardPaged(half *hidden_states, const PagedKVCa
     return Result<void>::ok();
 }
 
+Result<void> TransformerLayer::forwardPagedBatch(half *hidden_states,
+                                               const PagedKVCacheView *views, int batch,
+                                               const int *d_rope_positions,
+                                               const float *rope_cos, const float *rope_sin,
+                                               cudaStream_t stream) {
+    auto ptr_result = Validator::validateNotNull(hidden_states, "hidden_states");
+    if (ptr_result.isErr()) {
+        TLLM_ERROR("forwardPagedBatch: {}", ptr_result.error());
+        return ptr_result;
+    }
+    if (views == nullptr || batch <= 0 || batch > ws_->max_batch_tokens ||
+        d_rope_positions == nullptr) {
+        return Result<void>::err("forwardPagedBatch: invalid batch args");
+    }
+    const int hidden_dim = config_.hidden_dim;
+    const int q_dim = config_.num_heads * config_.head_dim;
+    const int kv_dim = config_.num_kv_heads * config_.head_dim;
+
+    // 行校验：host 预校验可在进入层计算前按行归因；batch 内任何行非法即
+    // 整体失败（调用方据此把本批各行标记失败，不株连其它序列）。
+    for (int r = 0; r < batch; ++r) {
+        const PagedKVCacheView &kv = views[r];
+        if (kv.k_pool == nullptr || kv.v_pool == nullptr || kv.block_table == nullptr ||
+            kv.k_scratch == nullptr || kv.v_scratch == nullptr || kv.decode_len == nullptr) {
+            return Result<void>::err("forwardPagedBatch: null paged pointer at row " +
+                                     std::to_string(r));
+        }
+        if (kv.visible_blocks <= 0 || kv.block_size <= 0 || kv.max_num_blocks <= 0 ||
+            kv.max_visible_tokens <= 0) {
+            return Result<void>::err("forwardPagedBatch: invalid geometry at row " +
+                                     std::to_string(r));
+        }
+        if (kv.position < 0 || kv.position + 1 > kv.max_visible_tokens) {
+            return Result<void>::err("forwardPagedBatch: position at row " + std::to_string(r));
+        }
+        const int required_blocks = (kv.position + 1 + kv.block_size - 1) / kv.block_size;
+        if (kv.visible_blocks < required_blocks) {
+            return Result<void>::err("forwardPagedBatch: block table too short at row " +
+                                     std::to_string(r));
+        }
+        if (r > 0 && (kv.k_pool != views[0].k_pool || kv.v_pool != views[0].v_pool ||
+                      kv.k_scratch != views[0].k_scratch || kv.v_scratch != views[0].v_scratch ||
+                      kv.block_size != views[0].block_size ||
+                      kv.max_num_blocks != views[0].max_num_blocks ||
+                      kv.max_visible_tokens != views[0].max_visible_tokens)) {
+            return Result<void>::err("forwardPagedBatch: inconsistent shared fields at row " +
+                                     std::to_string(r));
+        }
+    }
+    const PagedKVCacheView &kv0 = views[0];
+
+    // decode 取址与 split 开关与 forwardPaged 同一来源；非法取值显式失败。
+    const auto mode_result = resolvePagedAttentionMode();
+    if (mode_result.isErr()) {
+        return Result<void>::err(mode_result.error());
+    }
+    const auto split_result = resolveAttnSplitKv();
+    if (split_result.isErr()) {
+        return Result<void>::err(split_result.error());
+    }
+    const bool use_direct = mode_result.value() == PagedAttentionMode::Direct;
+    const bool use_split = split_result.value() > 1;
+    const int  num_splits = split_result.value();
+    const float scale = 1.0f / std::sqrt(static_cast<float>(config_.head_dim));
+    const size_t layer_stride = static_cast<size_t>(kv0.max_num_blocks) *
+                                static_cast<size_t>(kv0.block_size) * static_cast<size_t>(kv_dim);
+    half *k_pool_layer = kv0.k_pool + layer_idx_ * layer_stride;
+    half *v_pool_layer = kv0.v_pool + layer_idx_ * layer_stride;
+
+    // Attention sublayer：x = x + attention(rms_norm(x))，投影/FFN 按
+    // [batch, *] 批量；RoPE/scatter/attention 逐行保持序列隔离。
+    rmsNorm(hidden_states, weights_.rms_att_weight, ws_->norm_output, batch, stream);
+    const half *x = ws_->norm_output;
+    kernels::w8a16_matmul(x, weights_.wq.data, weights_.wq.scales, weights_.wq.data_t,
+                          weights_.wq.scales_t, ws_->q_buf, batch, q_dim, hidden_dim,
+                          weights_.wq.group_size, stream);
+    kernels::w8a16_matmul(x, weights_.wk.data, weights_.wk.scales, weights_.wk.data_t,
+                          weights_.wk.scales_t, ws_->k_buf, batch, kv_dim, hidden_dim,
+                          weights_.wk.group_size, stream);
+    kernels::w8a16_matmul(x, weights_.wv.data, weights_.wv.scales, weights_.wv.data_t,
+                          weights_.wv.scales_t, ws_->v_buf, batch, kv_dim, hidden_dim,
+                          weights_.wv.group_size, stream);
+    if (weights_.wq_bias) {
+        kernels::add_bias_inplace(ws_->q_buf, weights_.wq_bias, batch, q_dim, stream);
+    }
+    if (weights_.wk_bias) {
+        kernels::add_bias_inplace(ws_->k_buf, weights_.wk_bias, batch, kv_dim, stream);
+    }
+    if (weights_.wv_bias) {
+        kernels::add_bias_inplace(ws_->v_buf, weights_.wv_bias, batch, kv_dim, stream);
+    }
+    // RoPE：逐 token 绝对位置（device int[batch]），一次调用覆盖全部行。
+    kernels::apply_rope_inplace_per_token_positions(
+        ws_->q_buf, ws_->k_buf, rope_cos, rope_sin, batch, d_rope_positions, config_.num_heads,
+        config_.num_kv_heads, config_.head_dim, stream);
+
+    for (int r = 0; r < batch; ++r) {
+        const PagedKVCacheView &kv = views[r];
+        const half             *q_row = ws_->q_buf + static_cast<size_t>(r) * q_dim;
+        half                   *k_row = ws_->k_buf + static_cast<size_t>(r) * kv_dim;
+        half                   *v_row = ws_->v_buf + static_cast<size_t>(r) * kv_dim;
+        half                   *attn_row = ws_->attn_buf + static_cast<size_t>(r) * hidden_dim;
+
+        kernels::paged_scatter_blocks_dev(k_row, k_pool_layer, kv.block_table, 1,
+                                          d_rope_positions + r, kv.block_size, kv_dim,
+                                          kv.max_num_blocks, stream);
+        kernels::paged_scatter_blocks_dev(v_row, v_pool_layer, kv.block_table, 1,
+                                          d_rope_positions + r, kv.block_size, kv_dim,
+                                          kv.max_num_blocks, stream);
+        if (use_direct) {
+            if (use_split) {
+                kernels::attention_decode_paged_splitkv(
+                    q_row, k_pool_layer, v_pool_layer, kv.block_table, attn_row, scale,
+                    config_.num_heads, config_.num_kv_heads, config_.head_dim, kv.decode_len,
+                    kv.block_size, kv.max_num_blocks, kv.visible_blocks, ws_->attn_partial,
+                    num_splits, stream);
+            } else {
+                kernels::attention_decode_paged(q_row, k_pool_layer, v_pool_layer, kv.block_table,
+                                                attn_row, scale, config_.num_heads,
+                                                config_.num_kv_heads, config_.head_dim,
+                                                kv.decode_len, kv.block_size, kv.max_num_blocks,
+                                                kv.visible_blocks, stream);
+            }
+        } else {
+            kernels::paged_gather_blocks_dev(kv.k_scratch, k_pool_layer, kv.block_table,
+                                             kv.decode_len, kv.block_size, kv_dim,
+                                             kv.max_num_blocks, kv.max_visible_tokens, stream);
+            kernels::paged_gather_blocks_dev(kv.v_scratch, v_pool_layer, kv.block_table,
+                                             kv.decode_len, kv.block_size, kv_dim,
+                                             kv.max_num_blocks, kv.max_visible_tokens, stream);
+            if (use_split) {
+                kernels::attention_decode_splitkv(q_row, kv.k_scratch, kv.v_scratch, attn_row,
+                                                  scale, config_.num_heads, config_.num_kv_heads,
+                                                  kv.decode_len, config_.head_dim,
+                                                  ws_->attn_partial, num_splits, stream);
+            } else {
+                kernels::attention_decode(q_row, kv.k_scratch, kv.v_scratch, attn_row, scale,
+                                          config_.num_heads, config_.num_kv_heads, kv.decode_len,
+                                          config_.head_dim, stream);
+            }
+        }
+    }
+    kernels::w8a16_matmul(ws_->attn_buf, weights_.wo.data, weights_.wo.scales, weights_.wo.data_t,
+                          weights_.wo.scales_t, ws_->attn_output, batch, hidden_dim, q_dim,
+                          weights_.wo.group_size, stream);
+    kernels::add_inplace(hidden_states, ws_->attn_output, batch * hidden_dim, stream);
+
+    // FFN sublayer：x = x + ffn(rms_norm(x))
+    rmsNorm(hidden_states, weights_.rms_ffn_weight, ws_->norm_output, batch, stream);
+    feedForward(ws_->norm_output, ws_->ffn_output, batch, stream);
+    kernels::add_inplace(hidden_states, ws_->ffn_output, batch * hidden_dim, stream);
+
+    return Result<void>::ok();
+}
+
 Result<void> TransformerLayer::runLayer(half *hidden_states, KVCacheManager &kv_cache, int seq_id,
                                         int position, int num_tokens, const int *decode_len,
                                         const int *rope_pos, const float *rope_cos,

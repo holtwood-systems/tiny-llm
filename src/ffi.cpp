@@ -118,6 +118,14 @@ struct TinyLlmHandleImpl {
     int g_tok_host = 0;
     int g_len_host = 0;
     int g_pos_host = 0;
+
+    // ── DEV-12 decode 行批量前向（TLLM_BATCH_DECODE=1，opt-in eager）──
+    // 行数上限与 kernel 模板实例一致（{2,4,8}）；eager 路径不建/不碰 graph。
+    tiny_llm::DeviceBuffer<int>  d_batch_token_in;     // [8]
+    tiny_llm::DeviceBuffer<int>  d_batch_rope_pos;     // [8]
+    tiny_llm::DeviceBuffer<int>  d_batch_decode_len;   // [8]
+    tiny_llm::DeviceBuffer<int>  d_batch_block_tables; // [8 * max_num_blocks]
+    tiny_llm::DeviceBuffer<half> d_batch_work;         // [8 * hidden]
 };
 
 // ── 内部工具 ─────────────────────────────────────────────
@@ -178,6 +186,92 @@ tiny_llm::Result<void> runFfiPagedDecode(TinyLlmHandleImpl                *h,
         if (r.isErr()) {
             return r;
         }
+    }
+    return tiny_llm::Result<void>::ok();
+}
+
+// ── DEV-12 decode 行批量前向（策略 1 纯 decode、logprobs_k==0、B∈{2,4,8}）──
+// 行压缩在 tinyllm_step 预扫描完成；本函数负责 metadata 上传、B 行 embed、
+// 逐层 forwardPagedBatch、末层 hidden 映回原槽。kernel/device 级失败为
+// 调用级失败：返回 err 时本批所有行记失败（与 ABI v3 单调用语义一致）。
+struct FfiBatchDecodeRow {
+    int        s;      // 原始输入槽位
+    int        seq_id;
+    int        pos;    // decode 绝对位置
+    int        nb;     // 本行块表长度
+    const int *bt;     // host 块表切片
+    int        token;
+};
+
+constexpr int kFfiBatchDecodeMax = 8;
+
+tiny_llm::Result<void> runFfiPagedDecodeBatch(TinyLlmHandleImpl                     *h,
+                                              const std::vector<FfiBatchDecodeRow> &rows) {
+    const int    B = static_cast<int>(rows.size());
+    const int    hidden = h->config.hidden_dim;
+    const size_t bt_stride = static_cast<size_t>(h->max_num_blocks);
+    if (h->d_batch_token_in.size() < kFfiBatchDecodeMax) {
+        h->d_batch_token_in = tiny_llm::DeviceBuffer<int>(kFfiBatchDecodeMax);
+        h->d_batch_rope_pos = tiny_llm::DeviceBuffer<int>(kFfiBatchDecodeMax);
+        h->d_batch_decode_len = tiny_llm::DeviceBuffer<int>(kFfiBatchDecodeMax);
+        h->d_batch_block_tables =
+            tiny_llm::DeviceBuffer<int>(static_cast<size_t>(kFfiBatchDecodeMax) * bt_stride);
+        h->d_batch_work = tiny_llm::DeviceBuffer<half>(
+            static_cast<size_t>(kFfiBatchDecodeMax) * static_cast<size_t>(hidden));
+    }
+
+    int toks[kFfiBatchDecodeMax], poss[kFfiBatchDecodeMax], lens[kFfiBatchDecodeMax];
+    for (int r = 0; r < B; ++r) {
+        toks[r] = rows[r].token;
+        poss[r] = rows[r].pos;
+        lens[r] = rows[r].pos + 1;
+    }
+    h->d_batch_token_in.copyFromHost(toks, static_cast<size_t>(B), h->stream);
+    h->d_batch_rope_pos.copyFromHost(poss, static_cast<size_t>(B), h->stream);
+    h->d_batch_decode_len.copyFromHost(lens, static_cast<size_t>(B), h->stream);
+    for (int r = 0; r < B; ++r) {
+        CUDA_CHECK(cudaMemcpyAsync(h->d_batch_block_tables.data() + r * bt_stride, rows[r].bt,
+                                   static_cast<size_t>(rows[r].nb) * sizeof(int),
+                                   cudaMemcpyHostToDevice, h->stream));
+    }
+
+    tiny_llm::kernels::gather_embeddings(h->d_batch_token_in.data(), h->weights.token_embedding,
+                                         h->d_batch_work.data(), B, hidden, h->config.vocab_size,
+                                         h->stream);
+
+    std::vector<tiny_llm::PagedKVCacheView> views(static_cast<size_t>(B));
+    for (int r = 0; r < B; ++r) {
+        auto &v = views[static_cast<size_t>(r)];
+        v.k_pool = h->paged_k_pool;
+        v.v_pool = h->paged_v_pool;
+        v.block_table = h->d_batch_block_tables.data() + r * bt_stride;
+        v.k_scratch = h->paged_k_scratch;
+        v.v_scratch = h->paged_v_scratch;
+        v.visible_blocks = rows[r].nb;
+        v.block_size = h->block_size;
+        v.max_num_blocks = h->max_num_blocks;
+        v.max_visible_tokens = h->max_visible_tokens;
+        v.position = rows[r].pos; // host 校验与 visible_blocks 推导用
+        v.decode_len = h->d_batch_decode_len.data() + r;
+        v.position_dev = nullptr; // scatter 位置走 d_batch_rope_pos（forwardPagedBatch 参数）
+    }
+
+    for (auto &layer : h->layers) {
+        auto r = layer->forwardPagedBatch(h->d_batch_work.data(), views.data(), B,
+                                          h->d_batch_rope_pos.data(), h->rope_cos, h->rope_sin,
+                                          h->stream);
+        if (r.isErr()) {
+            return r;
+        }
+    }
+    // 末层 hidden 映回原始槽位（与 queue_hidden_for_batch 同一 stream 语义）
+    for (int r = 0; r < B; ++r) {
+        CUDA_CHECK(cudaMemcpyAsync(h->d_batch_hidden.data() +
+                                       static_cast<size_t>(rows[r].s) * hidden,
+                                   h->d_batch_work.data() + static_cast<size_t>(r) * hidden,
+                                   static_cast<size_t>(hidden) * sizeof(half),
+                                   cudaMemcpyDeviceToDevice, h->stream));
+        h->sequences[rows[r].seq_id].position = rows[r].pos + 1;
     }
     return tiny_llm::Result<void>::ok();
 }
@@ -583,6 +677,64 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
         }
     }
 
+    // ── DEV-12：decode 行批量前向（TLLM_BATCH_DECODE=1 候选开关，默认关闭）──
+    // 预扫描与主循环同一套 ABI 语义：收集策略 1 纯 decode、logprobs_k==0、
+    // 校验通过的行；行数恰为 {2,4,8} 时整体走 forwardPagedBatch（eager，不建
+    // graph），否则全部行回落既有逐序列路径，行为与开关关闭完全一致。
+    std::vector<char> batch_handled(static_cast<size_t>(num_sequences), 0);
+    bool              batch_ok = false;
+    {
+        const char *bd_env = std::getenv("TLLM_BATCH_DECODE");
+        const bool  batch_decode_enabled =
+            h->paged_kv && batch_device_postprocess && bd_env != nullptr &&
+            std::string(bd_env) == "1";
+        if (batch_decode_enabled) {
+            std::vector<FfiBatchDecodeRow> rows;
+            int                            off2 = 0, toff2 = 0;
+            for (int s = 0; s < num_sequences; ++s) {
+                const int len = seq_lens[s];
+                if (len <= 0) continue;
+                if (!is_prefill[s] && len != 1) continue;
+                const int *toks = input_tokens + off2;
+                off2 += len;
+                const int *bt = nullptr;
+                int        nb = 0;
+                if (num_blocks != nullptr && block_tables != nullptr) {
+                    nb = num_blocks[s];
+                    if (nb > 0) {
+                        bt = block_tables + toff2;
+                        toff2 += nb;
+                    }
+                }
+                if (is_prefill[s]) continue;
+                auto it = h->sequences.find(seq_ids[s]);
+                if (it == h->sequences.end() || !it->second.allocated) continue;
+                const auto &st = it->second;
+                const int   block_size = h->block_size;
+                bool        bad = (bt == nullptr || nb <= 0 || nb > h->max_num_blocks);
+                for (int i = 0; !bad && i < nb; ++i) {
+                    bad = (bt[i] < 0 || bt[i] >= h->max_num_blocks);
+                }
+                const int need_blocks = (st.position + 1 + block_size - 1) / block_size;
+                if (bad || nb < need_blocks || st.position >= h->config.max_seq_len) continue;
+                rows.push_back({s, seq_ids[s], st.position, nb, bt, toks[0]});
+            }
+            const size_t bsz = rows.size();
+            if (bsz == 2 || bsz == 4 || bsz == 8) {
+                batch_ok = runFfiPagedDecodeBatch(h, rows).isOk();
+                for (const auto &r : rows) batch_handled[static_cast<size_t>(r.s)] = 1;
+                if (std::getenv("TLLM_FFI_DEBUG")) {
+                    fprintf(stderr, "  [ffi] TLLM_BATCH_DECODE: batched %zu decode rows, ok=%d\n",
+                            bsz, (int)batch_ok);
+                }
+            } else if (bsz > 0 && std::getenv("TLLM_FFI_DEBUG")) {
+                fprintf(stderr,
+                        "  [ffi] TLLM_BATCH_DECODE: %zu rows -> fallback (B not in {2,4,8})\n",
+                        bsz);
+            }
+        }
+    }
+
     int offset = 0;
     int table_offset = 0; // 扁平化 block_tables 中前面序列块数之和（策略 1）
     int ok_count = 0;
@@ -624,6 +776,12 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
                         bt = block_tables + table_offset;
                         table_offset += nb;
                     }
+                }
+                // 批量路径已处理（成功或调用级失败）的 decode 行：offset 与
+                // table_offset 已按同一规则推进，这里只记状态不再重复执行。
+                if (batch_handled[static_cast<size_t>(s)]) {
+                    seq_ok = batch_ok;
+                    goto seq_done;
                 }
                 if (bt == nullptr || nb <= 0 || nb > h->max_num_blocks) {
                     goto seq_done; // 块表缺失/块数非法

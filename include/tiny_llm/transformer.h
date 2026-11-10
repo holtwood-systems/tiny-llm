@@ -104,6 +104,17 @@ class TransformerLayer {
                               const int *rope_pos, const float *rope_cos, const float *rope_sin,
                               cudaStream_t stream = 0);
 
+    // DEV-12 纯 decode 行批量前向（eager，opt-in）：hidden_states [batch, hidden]
+    // 原位更新；views[r] 描述第 r 行的 paged KV 资源（block_table/decode_len/
+    // visible_blocks/position 逐行不同；pool/scratch/block_size/max_num_blocks/
+    // max_visible_tokens 须跨行一致）。d_rope_positions 为 device int[batch]，
+    // 同时供 per-token RoPE 与逐行 scatter 使用。每行 num_tokens==1；
+    // attention/KV scatter 逐行执行——摊薄的是投影/FFN 的权重读取，不是
+    // attention 本身。
+    Result<void> forwardPagedBatch(half *hidden_states, const PagedKVCacheView *views, int batch,
+                                   const int *d_rope_positions, const float *rope_cos,
+                                   const float *rope_sin, cudaStream_t stream = 0);
+
     // Get layer index
     int getLayerIdx() const noexcept { return layer_idx_; }
 
