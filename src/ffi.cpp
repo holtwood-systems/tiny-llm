@@ -120,7 +120,8 @@ struct TinyLlmHandleImpl {
     int g_pos_host = 0;
 
     // ── DEV-12 decode 行批量前向（TLLM_BATCH_DECODE=1，opt-in eager）──
-    // 行数上限与 kernel 模板实例一致（{2,4,8}）；eager 路径不建/不碰 graph。
+    // 行数集合为 kernel 模板实例 {2,4,8} 的子集 {4,8}（DEV-13：B=2 时 graph
+    // 重放优于 eager 批量，故不进入）；eager 路径不建/不碰 graph。
     tiny_llm::DeviceBuffer<int>  d_batch_token_in;     // [8]
     tiny_llm::DeviceBuffer<int>  d_batch_rope_pos;     // [8]
     tiny_llm::DeviceBuffer<int>  d_batch_decode_len;   // [8]
@@ -190,7 +191,7 @@ tiny_llm::Result<void> runFfiPagedDecode(TinyLlmHandleImpl                *h,
     return tiny_llm::Result<void>::ok();
 }
 
-// ── DEV-12 decode 行批量前向（策略 1 纯 decode、logprobs_k==0、B∈{2,4,8}）──
+// ── DEV-12 decode 行批量前向（策略 1 纯 decode、logprobs_k==0、B∈{4,8}）──
 // 行压缩在 tinyllm_step 预扫描完成；本函数负责 metadata 上传、B 行 embed、
 // 逐层 forwardPagedBatch、末层 hidden 映回原槽。kernel/device 级失败为
 // 调用级失败：返回 err 时本批所有行记失败（与 ABI v3 单调用语义一致）。
@@ -679,8 +680,10 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
 
     // ── DEV-12：decode 行批量前向（TLLM_BATCH_DECODE=1 候选开关，默认关闭）──
     // 预扫描与主循环同一套 ABI 语义：收集策略 1 纯 decode、logprobs_k==0、
-    // 校验通过的行；行数恰为 {2,4,8} 时整体走 forwardPagedBatch（eager，不建
+    // 校验通过的行；行数恰为 {4,8} 时整体走 forwardPagedBatch（eager，不建
     // graph），否则全部行回落既有逐序列路径，行为与开关关闭完全一致。
+    // B=2 排除（DEV-13 实测）：graph 重放的单行收益 > B=2 eager 批量摊薄，
+    // graph-batch 在 c2 下相对 graph-scalar 回退 ~11%；{4,8} 时批量全胜。
     std::vector<char> batch_handled(static_cast<size_t>(num_sequences), 0);
     bool              batch_ok = false;
     {
@@ -720,7 +723,7 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
                 rows.push_back({s, seq_ids[s], st.position, nb, bt, toks[0]});
             }
             const size_t bsz = rows.size();
-            if (bsz == 2 || bsz == 4 || bsz == 8) {
+            if (bsz == 4 || bsz == 8) {
                 batch_ok = runFfiPagedDecodeBatch(h, rows).isOk();
                 for (const auto &r : rows) batch_handled[static_cast<size_t>(r.s)] = 1;
                 if (std::getenv("TLLM_FFI_DEBUG")) {
@@ -729,7 +732,7 @@ int tinyllm_step(TinyLlmHandle *handle, const int *seq_ids, const int *input_tok
                 }
             } else if (bsz > 0 && std::getenv("TLLM_FFI_DEBUG")) {
                 fprintf(stderr,
-                        "  [ffi] TLLM_BATCH_DECODE: %zu rows -> fallback (B not in {2,4,8})\n",
+                        "  [ffi] TLLM_BATCH_DECODE: %zu rows -> fallback (B not in {4,8})\n",
                         bsz);
             }
         }

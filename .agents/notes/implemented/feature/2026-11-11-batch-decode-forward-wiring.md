@@ -16,13 +16,16 @@ DEV-10 设计包要求把策略 1 纯 decode 行的层主体 GEMM 从逐序列�
 `TLLM_BATCH_DECODE=1` 候选开关（ffi.cpp），eager、opt-in、不改 C ABI：
 
 - **层主体批量**：rmsNorm/QKV/bias/O/FFN 一次 M=B 调用——这些 kernel 本就
-  按 num_tokens 行批量，B∈{2,4,8} 时自动命中 DEV-11 的 small-M kernel。
+  按 num_tokens 行批量，B∈{2,4,8} 时自动命中 DEV-11 的 small-M kernel
+  （FFI 门后经 DEV-13 收窄为 {4,8}，kernel 实例集合不变）。
 - **逐行隔离保留**：`apply_rope_inplace_per_token_positions`（既有 kernel）
   一次覆盖全部行的绝对位置；scatter/attention 逐行循环，复用每条序列
   自己的块表切片与 `decode_len` device int——不引入新 attention kernel。
 - **行压缩**：`tinyllm_step` 预扫描用与主循环同一套 ABI 校验收集行；
-  行数恰为 {2,4,8} 才进入批量，否则全部回落——B=3/5/6/7 与
-  prefill/logprobs/策略 2 行行为零变化。
+  行数恰为 {4,8} 才进入批量，否则全部回落——B=2/3/5/6/7 与
+  prefill/logprobs/策略 2 行行为零变化。B=2 排除系 DEV-13 实测：
+  graph 重放单行优于 B=2 eager 批量，graph+batch 在 c2 回退 ~11%；
+  {4,8} 时批量相对 graph-scalar 全胜（详见 DEV-13 结果包）。
 - **metadata**：`d_batch_token_in/rope_pos/decode_len`（[8]）+ 扁平
   `d_batch_block_tables`（8×max_num_blocks，按行 stride）+ `d_batch_work`
   （[8×hidden]），每步 3 个定长 H2D + 逐行块表上传。
