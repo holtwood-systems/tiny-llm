@@ -129,6 +129,133 @@ double benchW8A16(const char *name, const char *shape, int M, int N, int K, int 
 }
 
 // ---------------------------------------------------------------------------
+// DEV-11 小 M W8A16：B 次 M=1 基线 vs 单次 M=B 路由，含独立 CPU 参考校验。
+// 输出列：route,shape,ms,verify  （M=1xB = B 次 M=1 调用；M=B = 单次批量调用）
+// ---------------------------------------------------------------------------
+void cpuW8A16Ref(const std::vector<__half> &input, const std::vector<int8_t> &weight,
+                 const std::vector<__half> &scales, std::vector<float> &out, int M, int N,
+                 int K, int group_size) {
+    const int scale_rows = (K + group_size - 1) / group_size;
+    out.assign(static_cast<size_t>(M) * N, 0.0f);
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                const float w = static_cast<float>(weight[static_cast<size_t>(k) * N + n]) *
+                                __half2float(scales[static_cast<size_t>(k / group_size) * N + n]);
+                acc += __half2float(input[static_cast<size_t>(m) * K + k]) * w;
+            }
+            out[static_cast<size_t>(m) * N + n] = acc;
+        }
+    }
+    (void)scale_rows;
+}
+
+void benchW8A16SmallM(int M, int N, int K, int group_size, int warmup, int iters) {
+    const int    scale_rows = (K + group_size - 1) / group_size;
+    std::mt19937 rng(20261110 + M * 131 + N + K);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_int_distribution<int>    idist(-127, 127);
+
+    std::vector<__half> h_input(static_cast<size_t>(M) * K);
+    std::vector<int8_t> h_weight(static_cast<size_t>(K) * N);
+    std::vector<__half> h_scales(static_cast<size_t>(scale_rows) * N);
+    for (auto &v : h_input) v = __float2half(dist(rng));
+    for (auto &v : h_weight) v = static_cast<int8_t>(idist(rng));
+    for (auto &v : h_scales) v = __float2half(0.01f + 0.01f * std::fabs(dist(rng)));
+
+    __half *d_input = nullptr, *d_scales = nullptr, *d_output = nullptr;
+    int8_t *d_weight = nullptr, *d_weight_t = nullptr;
+    __half *d_scales_t = nullptr;
+    check(cudaMalloc(&d_input, h_input.size() * sizeof(__half)), "cudaMalloc input");
+    check(cudaMalloc(&d_weight, h_weight.size()), "cudaMalloc weight");
+    check(cudaMalloc(&d_scales, h_scales.size() * sizeof(__half)), "cudaMalloc scales");
+    check(cudaMalloc(&d_output, static_cast<size_t>(M) * N * sizeof(__half)), "cudaMalloc out");
+    check(cudaMalloc(&d_weight_t, h_weight.size()), "cudaMalloc weight_t");
+    check(cudaMalloc(&d_scales_t, h_scales.size() * sizeof(__half)), "cudaMalloc scales_t");
+    check(cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(__half),
+                     cudaMemcpyHostToDevice),
+          "copy input");
+    check(cudaMemcpy(d_weight, h_weight.data(), h_weight.size(), cudaMemcpyHostToDevice),
+          "copy weight");
+    check(cudaMemcpy(d_scales, h_scales.data(), h_scales.size() * sizeof(__half),
+                     cudaMemcpyHostToDevice),
+          "copy scales");
+    tiny_llm::kernels::transpose_int8(d_weight, d_weight_t, K, N, 0);
+    tiny_llm::kernels::transpose_scales(d_scales, d_scales_t, scale_rows, N, 0);
+
+    // 独立 CPU 参考校验 M=B 路由结果（容差：fp16 累加，rel 1e-2 + abs 5e-2）
+    check(cudaMemset(d_output, 0, static_cast<size_t>(M) * N * sizeof(__half)), "memset out");
+    tiny_llm::kernels::w8a16_matmul(d_input, d_weight, d_scales, d_weight_t, d_scales_t,
+                                    d_output, M, N, K, group_size, 0);
+    check(cudaDeviceSynchronize(), "sync after verify call");
+    std::vector<__half> h_out(static_cast<size_t>(M) * N);
+    check(cudaMemcpy(h_out.data(), d_output, h_out.size() * sizeof(__half),
+                     cudaMemcpyDeviceToHost),
+          "copy out");
+    std::vector<float> ref;
+    cpuW8A16Ref(h_input, h_weight, h_scales, ref, M, N, K, group_size);
+    float max_abs = 0.0f, max_rel = 0.0f;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const float d = std::fabs(__half2float(h_out[i]) - ref[i]);
+        max_abs = std::max(max_abs, d);
+        max_rel = std::max(max_rel, d / (std::fabs(ref[i]) + 1e-6f));
+    }
+    const bool ok = (max_abs < 5e-2f) || (max_rel < 1e-2f);
+
+    // 基线：B 次 M=1 调用（转置快路径，行 i 输入行切片）
+    const double ms_m1xb = bench(
+        [&] {
+            for (int r = 0; r < M; ++r) {
+                tiny_llm::kernels::w8a16_matmul(d_input + static_cast<size_t>(r) * K, d_weight,
+                                                d_scales, d_weight_t, d_scales_t,
+                                                d_output + static_cast<size_t>(r) * N, 1, N, K,
+                                                group_size, 0);
+            }
+        },
+        warmup, iters);
+
+    // 被测：单次 M=B 调用（现有 dispatch）
+    const double ms_mb = bench(
+        [&] {
+            tiny_llm::kernels::w8a16_matmul(d_input, d_weight, d_scales, d_weight_t, d_scales_t,
+                                            d_output, M, N, K, group_size, 0);
+        },
+        warmup, iters);
+
+    std::printf("M=1x%d,K=%d,N=%d,%.4f,%s\n", M, K, N, ms_m1xb, ok ? "ok" : "VERIFY_FAIL");
+    std::printf("M=%d,K=%d,N=%d,%.4f,%s(max_abs=%.4f)\n", M, K, N, ms_mb,
+                ok ? "ok" : "VERIFY_FAIL", max_abs);
+
+    check(cudaFree(d_input), "free input");
+    check(cudaFree(d_weight), "free weight");
+    check(cudaFree(d_scales), "free scales");
+    check(cudaFree(d_weight_t), "free weight_t");
+    check(cudaFree(d_scales_t), "free scales_t");
+    check(cudaFree(d_output), "free output");
+}
+
+int runSmallMBench() {
+    int device_count = 0;
+    check(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
+    if (device_count == 0) {
+        std::fprintf(stderr, "kernel_bench: no CUDA device found\n");
+        return 1;
+    }
+    check(cudaSetDevice(0), "cudaSetDevice");
+    std::printf("route,shape(K,N),ms,verify\n");
+    // Qwen2.5-0.5B 真实层形状：q/o 896→896，k/v 896→128，gate/up 896→4864，
+    // down 4864→896；group_size=128（model_loader 统一）。
+    for (int M : {1, 2, 4, 8}) {
+        benchW8A16SmallM(M, 896, 896, 128, 20, 200);   // q/o
+        benchW8A16SmallM(M, 128, 896, 128, 20, 200);   // k/v
+        benchW8A16SmallM(M, 4864, 896, 128, 20, 200);  // gate/up
+        benchW8A16SmallM(M, 896, 4864, 128, 20, 200);  // down
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // FP16 lm_head  (weight [K, N])
 // ---------------------------------------------------------------------------
 double benchFP16(const char *name, const char *shape, int M, int N, int K, int warmup, int iters) {
@@ -1043,6 +1170,9 @@ DpaArgs parseDpaArgs(int argc, char **argv) {
 } // namespace
 
 int main(int argc, char **argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--smallm") return runSmallMBench();
+    }
     const DpaArgs dpa = parseDpaArgs(argc, argv);
     if (dpa.enabled) return runDpaBench(dpa);
 

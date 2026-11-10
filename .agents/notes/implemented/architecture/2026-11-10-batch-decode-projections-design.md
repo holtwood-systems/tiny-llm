@@ -1,6 +1,6 @@
 # Agent Note: batch decode 投影批处理设计包（DEV-10）
 
-Status: implemented（设计已交付待评审）
+Status: implemented
 
 ## Problem
 
@@ -22,7 +22,7 @@ attention 逐行保留；metadata 全固定地址 per-handle 缓冲；
 形状；`d_block_tables` 从单表扩为 batch 扁平表+行偏移；M∈[2,8] 的
 w8a16 dispatch 按 M*N 在 reference/tiled 间路由（DEV-11 实测对象）。
 
-## Alternatives
+## 备选方案
 
 - ragged batched attention 一次到位：复杂度不同量级，明确排除（§1）。
 - 整路径重写 forward：评审面爆炸，只新增不替换。

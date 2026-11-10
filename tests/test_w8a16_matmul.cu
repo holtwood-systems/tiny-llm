@@ -586,6 +586,138 @@ TEST_F(W8A16MatMulTest, TransposedFastPathMatchesCpuReference) {
     expectTransposedW8A16Matches(896, 4864, 128);
 }
 
+// ─────────────────────────────────────────────────────────────────
+// DEV-11：小 M 批量转置快路径（M ∈ {2,4,8}）
+// ─────────────────────────────────────────────────────────────────
+
+// 对 (M, N, K, group_size) 做新 dispatch（带转置缓冲）vs CPU float 参考的逐行差分。
+static void expectSmallMW8A16Matches(int M, int N, int K, int group_size) {
+    int num_groups = (K + group_size - 1) / group_size;
+
+    std::mt19937                          gen_in(42 + M);
+    std::uniform_real_distribution<float> dist_in(-1.0f, 1.0f);
+    std::vector<half>                     input(static_cast<size_t>(M) * K);
+    for (auto &v : input)
+        v = __float2half(dist_in(gen_in));
+
+    std::mt19937                       gen_w(123);
+    std::uniform_int_distribution<int> dist_w(-127, 127);
+    std::vector<int8_t>                weight(static_cast<size_t>(K) * N);
+    for (auto &v : weight)
+        v = static_cast<int8_t>(dist_w(gen_w));
+
+    std::mt19937                          gen_s(456);
+    std::uniform_real_distribution<float> dist_s(0.001f, 0.1f);
+    std::vector<half>                     scales(static_cast<size_t>(num_groups) * N);
+    for (auto &v : scales)
+        v = __float2half(dist_s(gen_s));
+
+    std::vector<int8_t> weight_t(static_cast<size_t>(N) * K);
+    for (int n = 0; n < N; ++n)
+        for (int k = 0; k < K; ++k)
+            weight_t[static_cast<size_t>(n) * K + k] = weight[static_cast<size_t>(k) * N + n];
+    std::vector<half> scales_t(static_cast<size_t>(N) * num_groups);
+    for (int n = 0; n < N; ++n)
+        for (int g = 0; g < num_groups; ++g)
+            scales_t[static_cast<size_t>(n) * num_groups + g] =
+                scales[static_cast<size_t>(g) * N + n];
+
+    DeviceBuffer<half>   d_input(M * K);
+    DeviceBuffer<int8_t> d_weight(K * N);
+    DeviceBuffer<half>   d_scales(num_groups * N);
+    DeviceBuffer<int8_t> d_weight_t(N * K);
+    DeviceBuffer<half>   d_scales_t(N * num_groups);
+    DeviceBuffer<half>   d_out(M * N);
+
+    d_input.copyFromHost(input.data(), M * K);
+    d_weight.copyFromHost(weight.data(), K * N);
+    d_scales.copyFromHost(scales.data(), num_groups * N);
+    d_weight_t.copyFromHost(weight_t.data(), N * K);
+    d_scales_t.copyFromHost(scales_t.data(), N * num_groups);
+
+    w8a16_matmul(d_input.data(), d_weight.data(), d_scales.data(), d_weight_t.data(),
+                 d_scales_t.data(), d_out.data(), M, N, K, group_size);
+    cudaDeviceSynchronize();
+
+    std::vector<half> out(M * N);
+    d_out.copyToHost(out.data(), M * N);
+    cudaDeviceSynchronize();
+
+    for (int m = 0; m < M; ++m) {
+        for (int col = 0; col < N; ++col) {
+            float cpu_sum = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                cpu_sum += __half2float(input[static_cast<size_t>(m) * K + k]) *
+                           static_cast<float>(weight[k * N + col]) *
+                           __half2float(scales[(k / group_size) * N + col]);
+            }
+            float tol = std::max(1e-1f, std::abs(cpu_sum) * 1e-2f);
+            EXPECT_NEAR(__half2float(out[static_cast<size_t>(m) * N + col]), cpu_sum, tol)
+                << "small-M path vs CPU at row " << m << " col " << col << " (M=" << M
+                << ",N=" << N << ",K=" << K << ",gs=" << group_size << ")";
+        }
+    }
+}
+
+TEST_F(W8A16MatMulTest, SmallMTransposedMatchesCpuReference) {
+    // 真实层形状 × B ∈ {2,4,8}：q/o 896→896、k/v 896→128、gate/up 896→4864、down 4864→896
+    for (int M : {2, 4, 8}) {
+        expectSmallMW8A16Matches(M, 896, 896, 128);
+        expectSmallMW8A16Matches(M, 128, 896, 128);
+        expectSmallMW8A16Matches(M, 4864, 896, 128);
+        expectSmallMW8A16Matches(M, 896, 4864, 128);
+    }
+}
+
+TEST_F(W8A16MatMulTest, SmallMTransposedTailsAndGroupBoundaries) {
+    // N/K 尾与非整除 group：N=130（非 warp 块倍数）、K=100（非 32 倍数）、
+    // K=130/gs=64（部分组）、K=128 边界整除
+    expectSmallMW8A16Matches(4, 130, 896, 128);
+    expectSmallMW8A16Matches(2, 896, 100, 128);
+    expectSmallMW8A16Matches(4, 64, 130, 64);
+    expectSmallMW8A16Matches(8, 64, 128, 128);
+}
+
+TEST_F(W8A16MatMulTest, SmallMNonTemplateMValuesFallBack) {
+    // M=3、M=5 非模板实例：交回既有 reference/tiled 路由，结果仍须正确
+    expectSmallMW8A16Matches(3, 896, 896, 128);
+    expectSmallMW8A16Matches(5, 4864, 896, 128);
+    // M=16 超出 kSmallMMax：交回 tiled 路径
+    expectSmallMW8A16Matches(16, 512, 896, 128);
+}
+
+TEST_F(W8A16MatMulTest, SmallMZeroAndExtremeInputs) {
+    // 全零输入 → 全零输出；含 0/正负混合由上方随机分布覆盖
+    int M = 4, N = 896, K = 896, group_size = 128;
+    int num_groups = K / group_size;
+    std::vector<half>   input(M * K, __float2half(0.0f));
+    std::vector<int8_t> weight_t(N * K, 127);
+    std::vector<half>   scales_t(N * num_groups, __float2half(0.5f));
+
+    DeviceBuffer<half>   d_input(M * K);
+    DeviceBuffer<int8_t> d_weight(K * N); // 未使用但须传非空
+    DeviceBuffer<half>   d_scales(num_groups * N);
+    DeviceBuffer<int8_t> d_weight_t(N * K);
+    DeviceBuffer<half>   d_scales_t(N * num_groups);
+    DeviceBuffer<half>   d_out(M * N);
+
+    std::vector<int8_t> weight(K * N, 127);
+    std::vector<half>   scales(num_groups * N, __float2half(0.5f));
+    d_input.copyFromHost(input.data(), M * K);
+    d_weight.copyFromHost(weight.data(), K * N);
+    d_scales.copyFromHost(scales.data(), num_groups * N);
+    d_weight_t.copyFromHost(weight_t.data(), N * K);
+    d_scales_t.copyFromHost(scales_t.data(), N * num_groups);
+
+    w8a16_matmul(d_input.data(), d_weight.data(), d_scales.data(), d_weight_t.data(),
+                 d_scales_t.data(), d_out.data(), M, N, K, group_size);
+    cudaDeviceSynchronize();
+    std::vector<half> out(M * N);
+    d_out.copyToHost(out.data(), M * N);
+    for (auto v : out)
+        EXPECT_EQ(__half2float(v), 0.0f);
+}
+
 TEST_F(W8A16MatMulTest, TransposedFastPathFallsBackWithoutBuffers) {
     // 不传 data_t/scales_t 时，新重载必须与旧路径行为一致（bitwise）。
     int M = 1, K = 128, N = 512, group_size = 64;

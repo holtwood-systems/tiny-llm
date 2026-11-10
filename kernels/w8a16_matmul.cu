@@ -358,6 +358,44 @@ __global__ void w8a16_matmul_m1_transposed_kernel(const half *__restrict__ input
     }
 }
 
+// 小 M decode 批量路径（转置权重 [N, K]）：一个 warp 负责一列，寄存器持有
+// M 个行累加器——weight_t[col,k] 每 lane 只读一次，摊薄到全部 M 行；
+// input 行读取为 warp 内广播（每行同地址），无额外带宽放大。
+// 适用 M ∈ [2, kSmallMMax]；更大 M 交回 tiled 路径。
+inline constexpr int kSmallMMax = 8;
+
+template <int MVAL>
+__global__ void w8a16_matmul_smallm_transposed_kernel(const half *__restrict__ input,
+                                                      const int8_t *__restrict__ weight_t,
+                                                      const half *__restrict__ scales_t,
+                                                      half *__restrict__ output, int N, int K,
+                                                      int group_size) {
+    const int warps_per_block = blockDim.x / 32;
+    const int col = blockIdx.x * warps_per_block + (threadIdx.x / 32);
+    if (col >= N) return;
+
+    const int lane = threadIdx.x & 31;
+    const int scale_rows = (K + group_size - 1) / group_size;
+    float      acc[MVAL];
+#pragma unroll
+    for (int m = 0; m < MVAL; ++m) acc[m] = 0.0f;
+
+    for (int k = lane; k < K; k += 32) {
+        const float w = static_cast<float>(weight_t[(size_t)col * K + k]) *
+                        __half2float(scales_t[(size_t)col * scale_rows + (k / group_size)]);
+#pragma unroll
+        for (int m = 0; m < MVAL; ++m) {
+            acc[m] += __half2float(input[(size_t)m * K + k]) * w;
+        }
+    }
+
+#pragma unroll
+    for (int m = 0; m < MVAL; ++m) {
+        const float sum = warp_reduce_sum(acc[m]);
+        if (lane == 0) output[(size_t)m * N + col] = __float2half(sum);
+    }
+}
+
 void w8a16_matmul(const half *input, const int8_t *weight, const half *scales, half *output, int M,
                   int N, int K, int group_size, cudaStream_t stream) {
     w8a16_matmul(input, weight, scales, /*weight_t=*/nullptr, /*scales_t=*/nullptr, output, M, N, K,
@@ -389,6 +427,29 @@ void w8a16_matmul(const half *input, const int8_t *weight, const half *scales,
                                                                group_size);
         }
         return;
+    }
+
+    // 小 M 批量 decode：转置布局可用时走 small-M 快路径（权重读取摊薄 M 行）。
+    if (M > 1 && M <= kSmallMMax && weight_t != nullptr && scales_t != nullptr) {
+        constexpr int WARPS_PER_BLOCK = 4; // 128 threads
+        dim3          block(WARPS_PER_BLOCK * 32);
+        dim3          grid((N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+        switch (M) {
+        case 2:
+            w8a16_matmul_smallm_transposed_kernel<2><<<grid, block, 0, stream>>>(
+                input, weight_t, scales_t, output, N, K, group_size);
+            return;
+        case 4:
+            w8a16_matmul_smallm_transposed_kernel<4><<<grid, block, 0, stream>>>(
+                input, weight_t, scales_t, output, N, K, group_size);
+            return;
+        case 8:
+            w8a16_matmul_smallm_transposed_kernel<8><<<grid, block, 0, stream>>>(
+                input, weight_t, scales_t, output, N, K, group_size);
+            return;
+        default:
+            break; // 非 {2,4,8}：交回下方既有 reference/tiled 路由
+        }
     }
 
     if (M * N < 4096) {
