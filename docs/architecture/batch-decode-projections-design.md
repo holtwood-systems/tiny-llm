@@ -176,7 +176,26 @@ host 侧预校验通过后，为每个入选行建立 `DecodeRow`：
 5. eager 稳定后评估 bucket 化 graph（可选，单独提交）。
 6. DEV-13 端到端 A/B 与默认值决策。
 
-## 11. 范围外（不在本设计与后续实现中承诺）
+## 11.5 DEV-12 就绪结论（2026-11-11，DEV-11 落地后补充）
+
+DEV-11 完成后复核 `forwardPaged`/`attentionPaged`/`feedForward`：层主体已按
+`num_tokens` 行批量——rmsNorm、Q/K/V/O、FFN 七个 GEMM 与 bias/silu/add
+全部行数无关，`M∈{2,4,8}` 时自动走新 small-M kernel。**因此 DEV-12 不需要
+新 kernel**，需要的新代码只有：
+
+- `TransformerLayer::forwardPagedBatch(x[B,H], views[B])`：批量 norm/QKV/
+  bias → **逐行** `apply_rope_inplace`（`rope_pos=d_pos+r`，kernel 不变）→
+  **逐行** `paged_scatter_blocks_dev` + `attention_decode_paged`
+  （`block_table=该序列自有指针`、`decode_len=d_len+r`）→ 批量 O/残差/FFN。
+- ffi.cpp 行压缩与开关：eager 路径无需 DEV-10 §6 的扁平块表——每行直接用
+  序列自有 `d_block_table` 指针；每步 2 个定长 H2D（`d_batch_rope_pos`、
+  `d_batch_decode_len`）。
+- `LayerWorkspace` 缓冲已是 `[max_batch,*]`（transformer.h:22-31），零新增。
+
+修正 DEV-10 §10 第 3 步的预期：`TLLM_BATCH_DECODE` 开关 + 单
+`forwardPagedBatch` 即覆盖第 2/3/5 阶段，工作量集中在行映射与差分测试。
+
+## 12. 范围外（不在本设计与后续实现中承诺）
 
 chunked prefill、prefix cache/sharing、抢占、TP、ragged/batched
 attention（§5 逐行保留）、新 C ABI、Rust 侧改动（除必要的对接测试）。
