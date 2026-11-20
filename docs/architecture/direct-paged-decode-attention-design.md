@@ -1,7 +1,7 @@
 # Direct Paged Decode Attention 设计包（TLLM-P0-004）
 
 > **Status: APPROVED（2026-09-14）—— 设计已定，可实现。**
-> 本文是 `ai-infra-interview-prep/L3_L4_DESIGN_REVIEW_PACKAGES.md` §3 模板的填充版，
+> 本文是私有评审材料 `L3_L4_DESIGN_REVIEW_PACKAGES.md` §3 模板的填充版，
 > 对应 §4（TLLM-DPA）与任务卡 `P0_P1_AGENT_BACKLOG.md` → TLLM-P0-004。
 > 本包只包含设计，不含实现；实现按 §10 的 PR-1…PR-6 推进。
 >
